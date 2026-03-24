@@ -1,0 +1,16 @@
+[Unit]
+Description=Multi-agent AI daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/agent
+ExecStart=/home/ubuntu/.local/bin/uv run python -m agent.main --no-cli
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

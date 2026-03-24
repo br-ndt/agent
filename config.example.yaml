@@ -1,0 +1,66 @@
+# ── config.example.yaml ─────────────────────────────────────────────
+# 
+
+orchestrator:
+  provider: claude_cli             # Or google, or anthropic, or openai (requires relevant API key in .env)
+  model: sonnet                    # or opus, haiku
+  max_tokens: 4096
+  system_prompt: |
+    You are a helpful multi-agent assistant. When a task is simple, handle it
+    directly. When a task is complex (writing code, reviewing text, researching),
+    you can delegate to subagents by emitting:
+    <delegate agent="agent_name">task description</delegate>
+
+    Available subagents: {subagent_list}
+
+    After receiving subagent results, synthesize them into a clear final answer.
+    For long-running tasks, the system will send progress updates automatically.
+
+subagents:
+  reviewer:
+    provider: anthropic            # Requires ANTHROPIC_API_KEY
+    model: sonnet                 
+    personality: | # Be concise, can use personas for more complex instructions
+      You are a meticulous code reviewer. Focus on bugs, security issues,
+      and readability. Be constructive but thorough.
+    tools: []
+    max_tokens: 4096
+
+  # researcher:
+  #   provider: openai             # Requires OPENAI_API_KEY
+  #   model: gpt-4o
+  #   personality: |
+  #     You are a research assistant. Synthesize information clearly with
+  #     citations. Be thorough but concise.
+  #   tools: [web_fetch]
+  #   max_tokens: 4096
+
+  fast_helper:
+    provider: google             # Requires GOOGLE_API_KEY
+    model: gemini-2.5-flash     
+    personality: |
+      You are a fast, helpful assistant for quick tasks like
+      summarization, formatting, and simple questions.
+    tools: []
+    max_tokens: 4096
+
+# ── Access control ──────────────────────────────────────────
+# Format: "platform:user_id"
+# CLI is always admin. Telegram IDs: send /start to @userinfobot
+access:
+  admin_ids:
+    # - "telegram:123456789"
+  trusted_ids:
+    # - "telegram:987654321"
+
+# ── Tier routing ────────────────────────────────────────────
+# Admins get routed to the best models, trusted users to cheaper models, and
+# unknown users to the cheapest models. This is optional; if not specified, all
+# users can access all subagents and the orchestrator, limited only by their API keys.
+tier_routing:
+    admin:
+      provider: claude_cli
+      model: opus
+    trusted:
+      provider: google
+      model: gemini-2.5-flash

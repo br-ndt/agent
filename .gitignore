@@ -1,0 +1,9 @@
+.env
+state/
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+personas/*.md
+!personas/README.md
+config.yaml
