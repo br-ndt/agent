@@ -1,6 +1,6 @@
 # agent
 
-Multi-agent AI daemon. Chat via Discord (or CLI), with multi-model subagent delegation, persona system, tier-based routing, and resilient provider fallback. Modeled after by [seb](https://github.com/sammcgrail/seb) [sven](https://github.com/svenflow/dispatch)
+Multi-agent AI daemon. Chat via Discord (or CLI), with multi-model subagent delegation, persona system, tier-based routing, and resilient provider fallback. Modeled after [seb](https://github.com/sammcgrail/seb) [sven](https://github.com/svenflow/dispatch)
 
 ## What this does
 
