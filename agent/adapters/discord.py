@@ -21,6 +21,7 @@ class DiscordAdapter(BaseAdapter):
 
         intents = discord.Intents.default()
         intents.message_content = True  # Required to read message text
+        intents.members = True
 
         self.client = discord.Client(intents=intents)
         self._on_message = None
@@ -51,30 +52,77 @@ class DiscordAdapter(BaseAdapter):
                 or f"<@!{bot_id}>" in message.content
             )
 
-            if not is_dm and not is_mentioned:
+            # Check if any role the bot has was mentioned
+            is_role_mentioned = False
+            bot_role_ids = set()
+            
+            if message.guild and message.guild.me:
+                # Extract raw IDs for a safe mathematical intersection
+                bot_role_ids = {role.id for role in message.guild.me.roles}
+                pinged_role_ids = {role.id for role in message.role_mentions}
+                
+                log.debug("role_check", 
+                          bot_has_roles=list(bot_role_ids), 
+                          message_pinged_roles=list(pinged_role_ids))
+
+                if bot_role_ids.intersection(pinged_role_ids):
+                    is_role_mentioned = True
+                    log.info("bot_role_pinged")
+
+            # Bail out if it's not a DM, not a direct mention, and not a role ping
+            if not is_dm and not is_mentioned and not is_role_mentioned:
                 return
 
-            # Strip the bot mention from the message text
+            # Strip the direct bot mentions
             text = message.content
             if self.client.user:
-                text = text.replace(f"<@{self.client.user.id}>", "").strip()
+                text = text.replace(f"<@{bot_id}>", "")
+                text = text.replace(f"<@!{bot_id}>", "")
+            
+            # Strip the role mentions so the LLM doesn't read the <@&ID> tags
+            if message.guild and message.role_mentions:
+                for role in message.role_mentions:
+                    if role.id in bot_role_ids:
+                        text = text.replace(f"<@&{role.id}>", "")
 
-            if not text:
+            text = text.strip()
+
+            if not text and (is_role_mentioned or is_mentioned):
+                text = "[System: You were pinged by the user.]"
+            elif not text:
                 return
 
             user_id = str(message.author.id)
             composite_id = f"discord:{user_id}"
 
-            # Access control
             if self.allowed_ids and composite_id not in self.allowed_ids:
                 log.debug("discord_unknown_user_dropped", user_id=user_id)
                 return
+
+            system_context = ""
+            if message.guild and hasattr(message.channel, 'members'):
+                # Get non-bot members who can see this channel
+                channel_members = [
+                    f"{m.display_name} (<@{m.id}>)" 
+                    for m in message.channel.members 
+                    if not m.bot
+                ]
+                
+                # Cap the list if you're in a massive server to save LLM context window tokens
+                if len(channel_members) > 50:
+                    channel_members = channel_members[:50]
+                
+                if channel_members:
+                    system_context = "\n\n[System Context: To ping a user, use their exact ID format. Users in this channel: " + ", ".join(channel_members) + "]"
+
+            # Append the system context to the text sent to the agent
+            final_text = text + system_context
 
             msg = IncomingMessage(
                 platform="discord",
                 sender_id=user_id,
                 sender_name=message.author.display_name,
-                text=text,
+                text=final_text,
                 chat_id=str(message.channel.id),
             )
 

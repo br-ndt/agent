@@ -3,7 +3,7 @@ name: code-reviewer
 description: "Review code for bugs, security issues, and readability"
 triggers: ["review", "check this code", "code review", "audit", "look for bugs"]
 subagent: reviewer
-allowed_tools: []
+allowed_tools: [web_browser, web_fetch, file_ops]
 ---
 
 # Code reviewer

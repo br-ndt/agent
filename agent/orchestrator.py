@@ -11,6 +11,7 @@ from agent.config import Config
 from agent.providers.base import BaseProvider
 from agent.session_store import SessionStore, PersistentSession
 from agent.subagent_runner import SubagentRunner
+from agent.skills import Skill, save_skill, load_skills
 
 log = structlog.get_logger()
 
@@ -23,6 +24,7 @@ class Orchestrator:
         subagent_runners: dict[str, SubagentRunner],
         providers: dict[str, BaseProvider] | None = None,
         session_store: SessionStore | None = None,
+        skills: list[Skill] | None = None,
     ):
         self.provider = provider
         self.providers = providers or {}
@@ -30,21 +32,34 @@ class Orchestrator:
         self.subagents = subagent_runners
         self.sessions: dict[str, PersistentSession] = {}
         self.session_store = session_store
-
-        # Build the system prompt with available subagent names
-        agent_list = ", ".join(self.subagents.keys()) if self.subagents else "none"
-        self.system_prompt = config.orchestrator_system_prompt.replace(
-            "{subagent_list}", agent_list
-        )
-        self.system_prompt = (
-            "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
-            "execute code, or use any tools. When a task requires code, files, or commands, "
-            "delegate it to a subagent. Just respond with text.\n\n"
-            + self.system_prompt
-        )
+        self.skills = skills or []
 
         # Summarizer: uses cheapest available model
         self._summarizer = self._make_summarizer()
+
+    def get_system_prompt(self) -> str:
+        """Dynamically build the system prompt with current subagents and skills."""
+        agent_list = ", ".join(self.subagents.keys()) if self.subagents else "none"
+        skill_list = ", ".join(f"'{s.name}' ({s.subagent})" for s in self.skills) if self.skills else "none"
+
+        prompt = self.config.orchestrator_system_prompt.replace("{subagent_list}", agent_list)
+        prompt = prompt.replace("{skill_list}", skill_list)
+
+        return (
+            "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
+            "execute code, or use any tools. When a task requires code, files, web pages, or commands, "
+            "delegate it to a subagent. Just respond with text.\n\n"
+            "## Synthesis Rule\n"
+            "When a subagent like 'researcher' reports the content of a page, do not summarize "
+            "it too heavily if the user's intent was to see what's on the page. "
+            "Provide a thorough report of the actual contents found.\n\n"
+            "## Skill System\n"
+            "You can learn and execute skills. A skill is a set of instructions for a subagent.\n"
+            "- To learn a skill, emit: <learn_skill name=\"name\" subagent=\"subagent_name\" description=\"short desc\">markdown instructions</learn_skill>\n"
+            "- To execute a skill, emit: <execute_skill name=\"name\">task for the skill</execute_skill>\n\n"
+            f"Current Skills: {skill_list}\n\n"
+            + prompt
+        )
 
     async def handle(
         self,
@@ -88,9 +103,10 @@ class Orchestrator:
         start = time.monotonic()
 
         # First pass: let the orchestrator decide what to do
+        system_prompt = self.get_system_prompt()
         response = await provider.complete(
             messages=session.get_messages_for_llm(),
-            system=self.system_prompt,
+            system=system_prompt,
             model=model,
             max_tokens=self.config.orchestrator_max_tokens,
         )
@@ -101,26 +117,69 @@ class Orchestrator:
 
         # Check for delegation blocks
         delegations = _parse_delegations(response.content)
+        skill_ops = _parse_skill_ops(response.content)
 
-        if not delegations:
+        if not delegations and not skill_ops:
             # Direct response — no delegation needed
             final = _strip_thinking(response.content)
             await session.add_message("assistant", final)
             return final
+
+        # --- Handle Skill Operations ---
+        skill_results = []
+        for op in skill_ops:
+            if op["type"] == "learn":
+                try:
+                    new_skill = Skill(
+                        name=op["name"],
+                        subagent=op["subagent"],
+                        description=op["description"],
+                        content=op["content"],
+                    )
+                    save_skill(new_skill)
+                    self.skills.append(new_skill)
+                    
+                    # Update relevant subagent runner personality
+                    if op["subagent"] in self.subagents:
+                        runner = self.subagents[op["subagent"]]
+                        skill_block = f"### Skill: {op['name']}\n{op['description']}\n\n{op['content']}"
+                        if "## Skills" not in runner.config.personality:
+                            runner.config.personality += "\n\n## Skills\n"
+                        runner.config.personality += f"\n\n---\n\n{skill_block}"
+                    
+                    skill_results.append(f"[Skill System] Successfully learned new skill: {op['name']} for subagent {op['subagent']}")
+                    log.info("skill_learned", name=op["name"], subagent=op["subagent"])
+                except Exception as e:
+                    skill_results.append(f"[Skill System] ERROR: Failed to learn skill {op['name']}: {e}")
+                    log.error("skill_learn_failed", name=op["name"], error=str(e))
+            
+            elif op["type"] == "execute":
+                skill = next((s for s in self.skills if s.name.lower() == op["name"].lower()), None)
+                if skill:
+                    # Treat execution as a delegation to the skill's subagent
+                    delegations.append({
+                        "agent": skill.subagent,
+                        "task": f"Using your skill '{skill.name}', perform the following task: {op['task']}"
+                    })
+                    log.info("skill_execution_triggered", name=skill.name, agent=skill.subagent)
+                else:
+                    skill_results.append(f"[Skill System] ERROR: Skill '{op['name']}' not found.")
+                    log.warning("skill_not_found", name=op["name"])
 
         # Delegation mode: fan out to subagents in parallel
         valid_delegations = [
             d for d in delegations if d["agent"] in self.subagents
         ]
 
-        if not valid_delegations:
+        if not valid_delegations and not skill_results:
             # Orchestrator tried to delegate to unknown agents — just return raw
             final = _strip_thinking(response.content)
             await session.add_message("assistant", final)
             return final
 
         agent_names = [d["agent"] for d in valid_delegations]
-        await reply_fn(f"Working on it — delegating to {', '.join(agent_names)}...")
+        all_ops_desc = ", ".join(agent_names + [f"Skill:{op['name']}" for op in skill_ops if op['type'] == 'learn'])
+        await reply_fn(f"Working on it — delegating to {all_ops_desc}...")
 
         # Run subagents concurrently
         tasks = [
@@ -130,7 +189,7 @@ class Orchestrator:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Format results for synthesis
-        result_parts = []
+        result_parts = skill_results  # Include any skill learning successes/errors
         for d, result in zip(valid_delegations, results):
             if isinstance(result, Exception):
                 result_parts.append(
@@ -152,7 +211,7 @@ class Orchestrator:
 
         final_response = await provider.complete(
             messages=session.get_messages_for_llm(),
-            system=self.system_prompt,
+            system=self.get_system_prompt(),
             model=model,
             max_tokens=self.config.orchestrator_max_tokens,
         )
@@ -193,9 +252,38 @@ def _parse_delegations(text: str) -> list[dict]:
     return [{"agent": agent, "task": task.strip()} for agent, task in matches]
 
 
+def _parse_skill_ops(text: str) -> list[dict]:
+    """Extract <learn_skill> and <execute_skill> blocks."""
+    ops = []
+    
+    # <learn_skill name="..." subagent="..." description="...">markdown</learn_skill>
+    learn_pattern = r'<learn_skill\s+name="([^"]+)"\s+subagent="([^"]+)"\s+description="([^"]*)">(.*?)</learn_skill>'
+    for name, subagent, desc, content in re.findall(learn_pattern, text, re.DOTALL):
+        ops.append({
+            "type": "learn",
+            "name": name,
+            "subagent": subagent,
+            "description": desc,
+            "content": content.strip()
+        })
+
+    # <execute_skill name="...">task</execute_skill>
+    exec_pattern = r'<execute_skill\s+name="([^"]+)">(.*?)</execute_skill>'
+    for name, task in re.findall(exec_pattern, text, re.DOTALL):
+        ops.append({
+            "type": "execute",
+            "name": name,
+            "task": task.strip()
+        })
+    
+    return ops
+
+
 def _strip_thinking(text: str) -> str:
     """Remove any <thinking> blocks and delegation XML from output."""
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
     text = re.sub(r'<delegate\s+agent="\w+">.*?</delegate>', "", text, flags=re.DOTALL)
+    text = re.sub(r'<learn_skill\s+.*?>.*?</learn_skill>', "", text, flags=re.DOTALL)
+    text = re.sub(r'<execute_skill\s+.*?>.*?</execute_skill>', "", text, flags=re.DOTALL)
     return text.strip()
 
