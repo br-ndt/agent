@@ -14,6 +14,7 @@ from agent.personas import load_personas, apply_persona
 from agent.providers import build_providers, build_resilient_providers
 from agent.router import Router
 from agent.session_store import SessionStore
+from agent.status_server import configure as configure_status, start_status_server
 from agent.subagent_runner import SubagentRunner
 
 structlog.configure(
@@ -87,6 +88,10 @@ async def main():
 
     # ── Build router ──────────────────────────────────────────
     router = Router(cfg, orchestrator)
+
+    # ── Status server ─────────────────────────────────────────
+    configure_status(router, orchestrator, providers, cfg)
+    status_runner = await start_status_server(port=cfg.status_port)
 
     # ── Start adapters ────────────────────────────────────────
     adapter_tasks = []
