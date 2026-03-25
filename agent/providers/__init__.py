@@ -18,8 +18,16 @@ def build_providers(cfg: Config) -> dict[str, BaseProvider]:
     # Claude CLI provider — uses your Pro/Max subscription (no API key needed)
     if shutil.which("claude"):
         from .claude_cli import ClaudeCLIProvider
-        providers["claude_cli"] = ClaudeCLIProvider()
-        log.info("provider_registered", name="claude_cli", auth="OAuth (subscription)")
+        # Text-only version (for orchestrator if needed)
+        providers["claude_cli"] = ClaudeCLIProvider(
+            disallowed_tools=["Bash", "Read", "Write", "Edit", "ListDir",
+                              "Grep", "Glob", "WebSearch", "WebFetch"],
+        )
+        # Tool-enabled version (for coder subagent)
+        providers["claude_cli_tools"] = ClaudeCLIProvider(
+            allowed_tools=["Bash", "Write", "Read", "Edit"],
+            timeout=300,
+        )
     else:
         log.debug("claude_cli_not_available",
                   hint="Install: npm install -g @anthropic-ai/claude-code && claude login")

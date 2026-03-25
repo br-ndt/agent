@@ -7,3 +7,4 @@ __pycache__/
 personas/*.md
 !personas/README.md
 config.yaml
+workspaces/

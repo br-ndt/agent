@@ -43,8 +43,11 @@ MODEL_ALIASES = {
 class ClaudeCLIProvider(BaseProvider):
     """Calls Claude via the CLI subprocess using your subscription."""
 
-    def __init__(self, timeout: int = 300):
+    def __init__(self, timeout: int = 300, allowed_tools: list[str] | None = None, disallowed_tools: list[str] | None = None, cwd: str | None = None):
         self.timeout = timeout
+        self.allowed_tools = allowed_tools or []
+        self.disallowed_tools = disallowed_tools or []
+        self.cwd = cwd
 
     async def complete(
         self,
@@ -54,6 +57,7 @@ class ClaudeCLIProvider(BaseProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tools: list[dict] | None = None,
+        cwd: str | None = None
     ) -> LLMResponse:
         cli_model = MODEL_ALIASES.get(model, model)
 
@@ -63,6 +67,11 @@ class ClaudeCLIProvider(BaseProvider):
             "--output-format", "json",
             "--model", cli_model,
         ]
+
+        if self.allowed_tools:
+            cmd.extend(["--allowedTools", " ".join(self.allowed_tools)])
+        if self.disallowed_tools:
+            cmd.extend(["--disallowedTools", " ".join(self.disallowed_tools)])
 
         if system:
             cmd.extend(["--system-prompt", system])
@@ -81,6 +90,7 @@ class ClaudeCLIProvider(BaseProvider):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd or self.cwd,
             )
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(

@@ -36,6 +36,12 @@ class Orchestrator:
         self.system_prompt = config.orchestrator_system_prompt.replace(
             "{subagent_list}", agent_list
         )
+        self.system_prompt = (
+            "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
+            "execute code, or use any tools. When a task requires code, files, or commands, "
+            "delegate it to a subagent. Just respond with text.\n\n"
+            + self.system_prompt
+        )
 
         # Summarizer: uses cheapest available model
         self._summarizer = self._make_summarizer()
@@ -88,6 +94,7 @@ class Orchestrator:
             model=model,
             max_tokens=self.config.orchestrator_max_tokens,
         )
+        log.info("orchestrator_raw_response", content=response.content[:500])
 
         elapsed = time.monotonic() - start
         log.info("orchestrator_response", elapsed=f"{elapsed:.1f}s", usage=response.usage)

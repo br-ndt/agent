@@ -120,6 +120,7 @@ class ResilientProvider(BaseProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tools: list[dict] | None = None,
+        **kwargs,
     ) -> LLMResponse:
         # Try primary provider
         if self.primary_circuit.is_available():
@@ -133,6 +134,7 @@ class ResilientProvider(BaseProvider):
                     max_tokens=max_tokens,
                     temperature=temperature,
                     tools=tools,
+                    **kwargs,
                 )
                 self.primary_circuit.record_success()
                 return result
@@ -161,6 +163,7 @@ class ResilientProvider(BaseProvider):
                     max_tokens=max_tokens,
                     temperature=temperature,
                     tools=tools,
+                    **kwargs,
                 )
                 self.fallback_circuit.record_success()
 
