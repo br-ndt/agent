@@ -21,6 +21,7 @@ class GoogleProvider(BaseProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tools: list[dict] | None = None,
+        cwd: str | None = None
     ) -> LLMResponse:
         # Convert from OpenAI-style messages to Gemini format
         contents = []

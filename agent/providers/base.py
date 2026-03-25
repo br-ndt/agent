@@ -22,4 +22,5 @@ class BaseProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tools: list[dict] | None = None,
+        cwd: str | None = None,
     ) -> LLMResponse: ...
