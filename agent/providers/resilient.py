@@ -140,6 +140,7 @@ class ResilientProvider(BaseProvider):
                 self.primary_circuit.record_failure()
                 log.warning("primary_provider_failed",
                             error=str(e),
+                            error_type=type(e).__name__,
                             will_fallback=self.fallback is not None)
 
                 if not self.fallback or _is_permanent(e):

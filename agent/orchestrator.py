@@ -56,6 +56,13 @@ class Orchestrator:
 
         # Look up the provider, fall back to default
         provider = self.providers.get(provider_name, self.provider)
+        log.info("orchestrator_routing", 
+                 provider_name=provider_name, 
+                 model=model, 
+                 provider_type=type(provider).__name__,
+                 tier=tier,
+                 tier_route=tier_route,
+                 providers_keys=list(self.providers.keys()))
         
         if session_id not in self.sessions:
             session = PersistentSession(
@@ -172,16 +179,16 @@ class Orchestrator:
         return summarize
 
 
-    def _parse_delegations(text: str) -> list[dict]:
-        """Extract <delegate agent="name">task</delegate> blocks."""
-        pattern = r'<delegate\s+agent="(\w+)">(.*?)</delegate>'
-        matches = re.findall(pattern, text, re.DOTALL)
-        return [{"agent": agent, "task": task.strip()} for agent, task in matches]
+def _parse_delegations(text: str) -> list[dict]:
+    """Extract <delegate agent="name">task</delegate> blocks."""
+    pattern = r'<delegate\s+agent="(\w+)">(.*?)</delegate>'
+    matches = re.findall(pattern, text, re.DOTALL)
+    return [{"agent": agent, "task": task.strip()} for agent, task in matches]
 
 
-    def _strip_thinking(text: str) -> str:
-        """Remove any <thinking> blocks and delegation XML from output."""
-        text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
-        text = re.sub(r'<delegate\s+agent="\w+">.*?</delegate>', "", text, flags=re.DOTALL)
-        return text.strip()
+def _strip_thinking(text: str) -> str:
+    """Remove any <thinking> blocks and delegation XML from output."""
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
+    text = re.sub(r'<delegate\s+agent="\w+">.*?</delegate>', "", text, flags=re.DOTALL)
+    return text.strip()
 
