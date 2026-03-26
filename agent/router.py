@@ -51,7 +51,12 @@ class Router:
             return
 
         # Admin commands
-        if tier == "admin" and msg.text.upper() in ("RESTART", "HEALME", "STATUS"):
+        if tier == "admin" and msg.text.upper() in (
+            "RESTART",
+            "HEALME",
+            "STATUS",
+            "COSTS",
+        ):
             await self._handle_admin_command(msg)
             return
 
@@ -76,7 +81,9 @@ class Router:
                 tier=tier,
                 tier_route=tier_route,
             )
-            log.info("router_got_response", platform=msg.platform, response_len=len(response))
+            log.info(
+                "router_got_response", platform=msg.platform, response_len=len(response)
+            )
             await adapter.send(msg.chat_id, response)
         except Exception as e:
             log.error("orchestrator_error", error=str(e), exc_info=True)
@@ -102,3 +109,23 @@ class Router:
         elif cmd == "RESTART":
             await adapter.send(msg.chat_id, "Restarting...")
             raise SystemExit(0)
+        elif cmd == "COSTS":
+            if (
+                hasattr(self.orchestrator, "cost_tracker")
+                and self.orchestrator.cost_tracker
+            ):
+                summary = await self.orchestrator.cost_tracker.get_today()
+                lines = [
+                    f"Today's costs: ${summary['total_cost_usd']:.4f} ({summary['total_calls']} calls)"
+                ]
+                for p in summary.get("by_provider", []):
+                    lines.append(
+                        f"  {p['provider']}:{p['model']} — ${p['cost_usd']:.4f} ({p['calls']} calls)"
+                    )
+                for a in summary.get("by_agent", []):
+                    lines.append(
+                        f"  agent:{a['agent']} — ${a['cost_usd']:.4f} ({a['calls']} calls, avg {a['avg_duration_ms']}ms)"
+                    )
+                await adapter.send(msg.chat_id, "\n".join(lines))
+            else:
+                await adapter.send(msg.chat_id, "Cost tracker not available.")

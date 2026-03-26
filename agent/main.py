@@ -9,6 +9,7 @@ import structlog
 from agent.adapters import cli as cli_adapter, discord as discord_adapter
 
 from agent.config import load_config
+from agent.cost_tracker import CostTracker
 from agent.orchestrator import Orchestrator
 from agent.personas import load_personas, apply_persona
 from agent.skills import load_skills
@@ -39,13 +40,22 @@ async def main():
     # ── Build providers ───────────────────────────────────────
     providers = build_resilient_providers(cfg)
     if not providers:
-        log.error("no_providers_configured",
-                  hint="Set at least ANTHROPIC_API_KEY in .env")
+        log.error(
+            "no_providers_configured", hint="Set at least ANTHROPIC_API_KEY in .env"
+        )
         sys.exit(1)
 
     log.info("providers_ready", providers=list(providers.keys()))
     personas = load_personas()
     skills = load_skills()
+
+    # ── Session store ─────────────────────────────────────────
+    session_store = SessionStore()
+    await session_store.init()
+
+    # ── Cost tracker ──────────────────────────────────────────
+    cost_tracker = CostTracker()
+    await cost_tracker.init()
 
     # ── Build subagent runners ────────────────────────────────
     subagent_runners: dict[str, SubagentRunner] = {}
@@ -60,22 +70,29 @@ async def main():
             if relevant_skills:
                 skill_blocks = []
                 for s in relevant_skills:
-                    skill_blocks.append(f"### Skill: {s.name}\n{s.description}\n\n{s.content}")
-                
-                sa_cfg.personality += "\n\n## Skills\n" + "\n\n---\n\n".join(skill_blocks)
+                    skill_blocks.append(
+                        f"### Skill: {s.name}\n{s.description}\n\n{s.content}"
+                    )
+
+                sa_cfg.personality += "\n\n## Skills\n" + "\n\n---\n\n".join(
+                    skill_blocks
+                )
                 log.info("skills_injected", agent=name, count=len(relevant_skills))
 
-            subagent_runners[name] = SubagentRunner(sa_cfg, providers[sa_cfg.provider])
-            log.info("subagent_registered",
-                    name=name, provider=sa_cfg.provider, model=sa_cfg.model,
-                    has_persona=name in personas)
+            subagent_runners[name] = SubagentRunner(
+                sa_cfg, providers[sa_cfg.provider], cost_tracker=cost_tracker
+            )
+            log.info(
+                "subagent_registered",
+                name=name,
+                provider=sa_cfg.provider,
+                model=sa_cfg.model,
+                has_persona=name in personas,
+            )
         else:
-            log.warning("subagent_skipped_no_provider",
-                        name=name, provider=sa_cfg.provider)
-
-    # ── Session store ─────────────────────────────────────────
-    session_store = SessionStore()
-    await session_store.init()
+            log.warning(
+                "subagent_skipped_no_provider", name=name, provider=sa_cfg.provider
+            )
 
     # ── Build orchestrator ────────────────────────────────────
     # Inject orchestrator persona
@@ -87,9 +104,11 @@ async def main():
     if not orch_provider:
         # Fall back to first available provider
         orch_provider = next(iter(providers.values()))
-        log.warning("orchestrator_provider_fallback",
-                    wanted=cfg.orchestrator_provider,
-                    using=next(iter(providers.keys())))
+        log.warning(
+            "orchestrator_provider_fallback",
+            wanted=cfg.orchestrator_provider,
+            using=next(iter(providers.keys())),
+        )
 
     orchestrator = Orchestrator(
         provider=orch_provider,
@@ -98,13 +117,14 @@ async def main():
         providers=providers,
         session_store=session_store,
         skills=skills,
+        cost_tracker=cost_tracker,
     )
 
     # ── Build router ──────────────────────────────────────────
     router = Router(cfg, orchestrator)
 
     # ── Status server ─────────────────────────────────────────
-    configure_status(router, orchestrator, providers, cfg)
+    configure_status(router, orchestrator, providers, cfg, cost_tracker)
     status_runner = await start_status_server(port=cfg.status_port)
 
     # ── Start adapters ────────────────────────────────────────
@@ -118,7 +138,7 @@ async def main():
         discord_bot = discord_adapter.DiscordAdapter(
             token=cfg.discord_bot_token,
             allowed_ids=cfg.admin_ids | cfg.trusted_ids or None,
-            other_bot_ids=cfg.other_bot_ids if hasattr(cfg, 'other_bot_ids') else None,
+            other_bot_ids=cfg.other_bot_ids if hasattr(cfg, "other_bot_ids") else None,
             relevance_provider=relevance_provider,
             relevance_model="gemini-2.5-flash",
             other_bots=cfg.other_bots,
@@ -130,6 +150,7 @@ async def main():
     # Telegram adapter (if token provided)
     if cfg.telegram_bot_token:
         from agent.adapters.telegram import TelegramAdapter
+
         telegram = TelegramAdapter(
             token=cfg.telegram_bot_token,
             allowed_ids=cfg.admin_ids | cfg.trusted_ids or None,
@@ -149,10 +170,12 @@ async def main():
     for task in adapter_tasks:
         asyncio.create_task(task)
 
-    log.info("agent_ready",
-             adapters=list(router.adapters.keys()),
-             subagents=list(subagent_runners.keys()),
-             daemon_mode=daemon_mode)
+    log.info(
+        "agent_ready",
+        adapters=list(router.adapters.keys()),
+        subagents=list(subagent_runners.keys()),
+        daemon_mode=daemon_mode,
+    )
 
     if daemon_mode:
         # Run forever — Discord/Telegram adapters handle messages
@@ -163,6 +186,7 @@ async def main():
 
     # Graceful shutdown
     log.info("agent_shutting_down")
+    await cost_tracker.close()
     await session_store.close()
     for name, adapter in router.adapters.items():
         if name != "cli":

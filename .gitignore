@@ -1,5 +1,6 @@
 .env
 state/
+state/costs.db
 __pycache__/
 *.pyc
 .venv/

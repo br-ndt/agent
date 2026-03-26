@@ -15,6 +15,8 @@ from aiohttp import web
 
 import structlog
 
+from agent.cost_tracker import CostTracker
+
 log = structlog.get_logger()
 
 # Set at startup by main.py
@@ -23,16 +25,18 @@ _router = None
 _orchestrator = None
 _providers: dict = {}
 _config = None
+_cost_tracker = None
 
 
-def configure(router, orchestrator, providers, config):
+def configure(router, orchestrator, providers, config, cost_tracker=None):
     """Called once at startup to wire in references."""
-    global _start_time, _router, _orchestrator, _providers, _config
+    global _start_time, _router, _orchestrator, _providers, _config, _cost_tracker
     _start_time = time.time()
     _router = router
     _orchestrator = orchestrator
     _providers = providers
     _config = config
+    _cost_tracker = cost_tracker
 
 
 def _uptime() -> str:
@@ -155,25 +159,40 @@ async def handle_index(request):
         lines.append("  Subagents:")
         for name, info in stats["subagents"].items():
             tools = ", ".join(info["tools"]) if info["tools"] else "none"
-            lines.append(f"    {name}: {info['provider']}:{info['model']} tools=[{tools}]")
+            lines.append(
+                f"    {name}: {info['provider']}:{info['model']} tools=[{tools}]"
+            )
 
     lines.append("")
-    lines.append(f"  Last checked: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
+    lines.append(
+        f"  Last checked: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+    )
 
     return web.Response(text="\n".join(lines), content_type="text/plain")
 
 
 async def handle_health(request):
     """Minimal health check — returns 200 if alive."""
-    return web.json_response({
-        "status": "ok",
-        "uptime_seconds": int(time.time() - _start_time),
-    })
+    return web.json_response(
+        {
+            "status": "ok",
+            "uptime_seconds": int(time.time() - _start_time),
+        }
+    )
 
 
 async def handle_stats(request):
     """Detailed JSON stats."""
     return web.json_response(_gather_stats())
+
+
+async def handle_costs(request):
+    """Cost and usage summary."""
+    days = int(request.query.get("days", "7"))
+    if _cost_tracker:
+        summary = await _cost_tracker.get_summary(days=days)
+        return web.json_response(summary)
+    return web.json_response({"error": "Cost tracker not configured"})
 
 
 async def start_status_server(port: int = 8765):
@@ -182,6 +201,7 @@ async def start_status_server(port: int = 8765):
     app.router.add_get("/", handle_index)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/stats", handle_stats)
+    app.router.add_get("/costs", handle_costs)
 
     runner = web.AppRunner(app)
     await runner.setup()

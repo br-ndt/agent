@@ -10,6 +10,7 @@ from pathlib import Path
 import structlog
 
 from agent.config import SubagentConfig
+from agent.cost_tracker import CostTracker
 from agent.providers.base import BaseProvider
 from agent.tools.bash import BashTool
 from agent.tools.file_ops import FileOpsTool
@@ -130,9 +131,15 @@ TOOL_DEFINITIONS = {
 class SubagentRunner:
     """Runs a subagent to completion with tools."""
 
-    def __init__(self, config: SubagentConfig, provider: BaseProvider):
+    def __init__(
+        self,
+        config: SubagentConfig,
+        provider: BaseProvider,
+        cost_tracker: CostTracker | None = None,
+    ):
         self.config = config
         self.provider = provider
+        self.cost_tracker = cost_tracker
 
     async def run(self, task: str, context: str = "", session_id: str = "") -> str:
         """Execute a task, with tool loop if tools are configured."""
@@ -172,21 +179,28 @@ class SubagentRunner:
         if has_tools:
             available = []
             if browser_tool:
-                available.append("web_browser(url) — fetch content via full browser (handles JS, dynamic content, SPA)")
+                available.append(
+                    "web_browser(url) — fetch content via full browser (handles JS, dynamic content, SPA)"
+                )
             if web_tool:
-                available.append("web_fetch(url) — fast, simple HTML fetch (use for basic articles/blogs)")
+                available.append(
+                    "web_fetch(url) — fast, simple HTML fetch (use for basic articles/blogs)"
+                )
             if bash_tool:
                 available.append("bash(command) — run shell commands")
             if file_tool:
-                available.append("read_file(path), write_file(path, content), edit_file(path, old, new), list_files(path)")
+                available.append(
+                    "read_file(path), write_file(path, content), edit_file(path, old, new), list_files(path)"
+                )
 
             tool_preamble = (
                 "## Tool Use Instructions\n"
                 "You have access to tools in your workspace. To use a tool, you MUST respond with "
                 "a JSON block like this and NOTHING ELSE in that message:\n"
                 '```tool\n{"tool": "tool_name", "args": {"key": "value"}}\n```\n\n'
-                "Available tools:\n" + "\n".join(f"- {t}" for t in available) +
-                f"\n\nYour workspace is: {workspace}\n"
+                "Available tools:\n"
+                + "\n".join(f"- {t}" for t in available)
+                + f"\n\nYour workspace is: {workspace}\n"
                 "IMPORTANT: For modern web apps (React, Vue, etc.), ALWAYS prefer `web_browser`. "
                 "After each tool call, you will see the result. When you have enough information to "
                 "answer the user, respond normally without any tool blocks.\n\n"
@@ -214,28 +228,48 @@ class SubagentRunner:
                 temperature=self.config.temperature,
                 cwd=str(workspace) if workspace else None,
             )
+            if self.cost_tracker:
+                await self.cost_tracker.log_call(
+                    provider=self.config.provider,
+                    model=self.config.model,
+                    usage=response.usage,
+                    agent=self.config.name,
+                    duration_ms=0,  # or track it
+                )
 
             log.info("subagent_turn", agent=self.config.name, turn=turn)
 
             # If no tools, or response doesn't contain tool calls, we're done
             if not has_tools:
-                log.info("subagent_response", agent=self.config.name, content_len=len(response.content), content=response)
+                log.info(
+                    "subagent_response",
+                    agent=self.config.name,
+                    content_len=len(response.content),
+                    content=response,
+                )
                 return response.content
 
             tool_call = _extract_tool_call(response.content)
             if not tool_call:
                 # No tool call in response — agent is done
-                log.info("subagent_response", agent=self.config.name, content_len=len(response.content), content=response)
+                log.info(
+                    "subagent_response",
+                    agent=self.config.name,
+                    content_len=len(response.content),
+                    content=response,
+                )
                 return response.content
 
             # Execute the tool
             tool_name = tool_call.get("tool", "")
             args = tool_call.get("args", {})
 
-            log.info("subagent_tool_call",
-                     agent=self.config.name,
-                     tool=tool_name,
-                     args_keys=list(args.keys()))
+            log.info(
+                "subagent_tool_call",
+                agent=self.config.name,
+                tool=tool_name,
+                args_keys=list(args.keys()),
+            )
 
             result = await self._execute_tool(
                 tool_name, args, bash_tool, file_tool, web_tool, browser_tool
@@ -243,14 +277,21 @@ class SubagentRunner:
 
             # Add the assistant response and tool result to history
             messages.append({"role": "assistant", "content": response.content})
-            messages.append({
-                "role": "user",
-                "content": f"Tool result for `{tool_name}`:\n```\n{json.dumps(result, indent=2)}\n```",
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"Tool result for `{tool_name}`:\n```\n{json.dumps(result, indent=2)}\n```",
+                }
+            )
 
         # Max turns reached
         log.warning("subagent_max_turns", agent=self.config.name, turns=MAX_TURNS)
-        log.info("subagent_response", agent=self.config.name, content_len=len(response.content), content=response)
+        log.info(
+            "subagent_response",
+            agent=self.config.name,
+            content_len=len(response.content),
+            content=response,
+        )
         return response.content
 
     async def _execute_tool(
@@ -269,7 +310,9 @@ class SubagentRunner:
             elif tool_name == "read_file" and file_tool:
                 return await file_tool.read(args.get("path", ""))
             elif tool_name == "write_file" and file_tool:
-                return await file_tool.write(args.get("path", ""), args.get("content", ""))
+                return await file_tool.write(
+                    args.get("path", ""), args.get("content", "")
+                )
             elif tool_name == "edit_file" and file_tool:
                 return await file_tool.edit(
                     args.get("path", ""), args.get("old", ""), args.get("new", "")
@@ -297,8 +340,8 @@ def _extract_tool_call(text: str) -> dict | None:
 
     # Try ```tool ... ``` blocks first
     patterns = [
-        r'```tool\s*\n(.*?)\n```',
-        r'```json\s*\n(.*?)\n```',
+        r"```tool\s*\n(.*?)\n```",
+        r"```json\s*\n(.*?)\n```",
         r'```\s*\n(\{.*?"tool".*?\})\n```',
     ]
 
@@ -313,7 +356,9 @@ def _extract_tool_call(text: str) -> dict | None:
                 continue
 
     # Try bare JSON with "tool" key
-    match = re.search(r'\{[^{}]*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^}]*\}[^}]*\}', text)
+    match = re.search(
+        r'\{[^{}]*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^}]*\}[^}]*\}', text
+    )
     if match:
         try:
             return json.loads(match.group())
