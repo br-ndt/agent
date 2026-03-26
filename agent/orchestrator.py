@@ -1,6 +1,7 @@
 """Orchestrator — main agent that can delegate to subagents."""
 
 import asyncio
+from pathlib import Path
 import re
 import time
 from typing import Callable, Awaitable
@@ -12,7 +13,15 @@ from agent.cost_tracker import CostTracker
 from agent.providers.base import BaseProvider
 from agent.session_store import SessionStore, PersistentSession
 from agent.subagent_runner import SubagentRunner
-from agent.skills import Skill, save_skill, load_skills
+from agent.skills import (
+    Skill,
+    SkillRegistry,
+    SkillExecutor,
+    SkillRun,
+    save_skill,
+    save_proposed_skill,
+    load_skills,
+)
 
 log = structlog.get_logger()
 
@@ -35,7 +44,13 @@ class Orchestrator:
         self.cost_tracker = cost_tracker
         self.sessions: dict[str, PersistentSession] = {}
         self.session_store = session_store
-        self.skills = skills or []
+        self.skill_registry = SkillRegistry(
+            skills_dir=(
+                Path(config.skills_dir) if hasattr(config, "skills_dir") else None
+            )
+        )
+        self.skill_executor = SkillExecutor(self.skill_registry)
+        self.skills = self.skill_registry.list_active()
 
         # Summarizer: uses cheapest available model
         self._summarizer = self._make_summarizer()
@@ -43,30 +58,48 @@ class Orchestrator:
     def get_system_prompt(self) -> str:
         """Dynamically build the system prompt with current subagents and skills."""
         agent_list = ", ".join(self.subagents.keys()) if self.subagents else "none"
-        skill_list = (
-            ", ".join(f"'{s.name}' ({s.subagent})" for s in self.skills)
-            if self.skills
-            else "none"
-        )
-
+        skill_catalog = self.skill_registry.build_catalog()
+    
         prompt = self.config.orchestrator_system_prompt.replace(
             "{subagent_list}", agent_list
         )
-        prompt = prompt.replace("{skill_list}", skill_list)
-
+        # Remove old {skill_list} placeholder if present
+        prompt = prompt.replace("{skill_list}", "see below")
+    
         return (
             "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
             "execute code, or use any tools. When a task requires code, files, web pages, or commands, "
             "delegate it to a subagent. Just respond with text.\n\n"
+    
             "## Synthesis Rule\n"
             "When a subagent like 'researcher' reports the content of a page, do not summarize "
             "it too heavily if the user's intent was to see what's on the page. "
             "Provide a thorough report of the actual contents found.\n\n"
+    
             "## Skill System\n"
-            "You can learn and execute skills. A skill is a set of instructions for a subagent.\n"
-            '- To learn a skill, emit: <learn_skill name="name" subagent="subagent_name" description="short desc">markdown instructions</learn_skill>\n'
-            '- To execute a skill, emit: <execute_skill name="name">task for the skill</execute_skill>\n\n'
-            f"Current Skills: {skill_list}\n\n" + prompt
+            "You can learn and execute skills.\n\n"
+    
+            "### Executing a skill\n"
+            "When a user's request matches a known skill (check triggers below), delegate using:\n"
+            '<execute_skill name="skill_name">any additional context from the user</execute_skill>\n\n'
+    
+            "For skills WITH structured steps, the system will execute each step automatically — "
+            "you don't need to break down the task. Just trigger the skill.\n\n"
+    
+            "For skills WITHOUT structured steps, the skill's instructions will be sent to the "
+            "appropriate subagent.\n\n"
+    
+            "### Learning a new skill\n"
+            'To learn a skill, emit: <learn_skill name="name" subagent="subagent_name" '
+            'description="short desc">markdown instructions</learn_skill>\n\n'
+    
+            "### Proposing a structured skill\n"
+            "When a user says something like 'make that a skill' after a multi-step conversation, "
+            'emit: <propose_skill name="name" subagent="subagent_name" '
+            'description="short desc">YAML steps list</propose_skill>\n\n'
+    
+            f"## Available Skills\n{skill_catalog}\n\n"
+            + prompt
         )
 
     async def handle(
@@ -179,28 +212,62 @@ class Orchestrator:
                     log.error("skill_learn_failed", name=op["name"], error=str(e))
 
             elif op["type"] == "execute":
-                skill = next(
-                    (s for s in self.skills if s.name.lower() == op["name"].lower()),
-                    None,
-                )
+                skill = self.skill_registry.get(op["name"])
                 if skill:
-                    # Treat execution as a delegation to the skill's subagent
-                    delegations.append(
-                        {
+                    if skill.has_steps:
+                        # Structured skill — use the executor
+                        subagent = self.subagents.get(skill.subagent)
+                        if subagent:
+                            run = await self.skill_executor.execute(
+                                skill=skill,
+                                task_context=op["task"],
+                                subagent_runner=subagent,
+                                session_id=session_id,
+                                triggered_by=session_id,
+                                progress_fn=reply_fn,
+                            )
+                            result_text = self.skill_executor.format_run_result(skill, run)
+                            skill_results.append(f"[Skill: {skill.name}] {result_text}")
+                        else:
+                            skill_results.append(
+                                f"[Skill System] ERROR: Subagent '{skill.subagent}' not found for skill '{skill.name}'"
+                            )
+                    else:
+                        # Unstructured skill — delegate like before
+                        delegations.append({
                             "agent": skill.subagent,
                             "task": f"Using your skill '{skill.name}', perform the following task: {op['task']}",
-                        }
-                    )
-                    log.info(
-                        "skill_execution_triggered",
-                        name=skill.name,
-                        agent=skill.subagent,
-                    )
+                        })
+                        log.info("skill_execution_triggered", name=skill.name, agent=skill.subagent)
                 else:
-                    skill_results.append(
-                        f"[Skill System] ERROR: Skill '{op['name']}' not found."
-                    )
+                    skill_results.append(f"[Skill System] ERROR: Skill '{op['name']}' not found.")
                     log.warning("skill_not_found", name=op["name"])
+
+            elif op["type"] == "propose":
+                try:
+                    # Parse the YAML steps from the content
+                    steps_data = yaml.safe_load(op["content"])
+                    steps = []
+                    if isinstance(steps_data, list):
+                        for sd in steps_data:
+                            steps.append(_dict_to_step(sd))
+            
+                    new_skill = Skill(
+                        name=op["name"],
+                        subagent=op["subagent"],
+                        description=op["description"],
+                        steps=steps,
+                        status="proposed",
+                        author="bot",
+                    )
+                    save_proposed_skill(new_skill)
+                    self.skill_registry.reload()
+                    skill_results.append(
+                        f"[Skill System] Proposed new skill: '{op['name']}' with {len(steps)} steps. "
+                        f"Use SKILL APPROVE {op['name']} to activate it."
+                    )
+                except Exception as e:
+                    skill_results.append(f"[Skill System] ERROR proposing skill: {e}")
 
         # Delegation mode: fan out to subagents in parallel
         valid_delegations = [d for d in delegations if d["agent"] in self.subagents]
@@ -323,6 +390,17 @@ def _parse_skill_ops(text: str) -> list[dict]:
     for name, task in re.findall(exec_pattern, text, re.DOTALL):
         ops.append({"type": "execute", "name": name, "task": task.strip()})
 
+    # <propose_skill name="..." subagent="..." description="...">YAML steps</propose_skill>
+    propose_pattern = r'<propose_skill\\s+name="([^"]+)"\\s+subagent="([^"]+)"\\s+description="([^"]*)">(.*?)</propose_skill>'
+    for name, subagent, desc, content in re.findall(propose_pattern, text, re.DOTALL):
+        ops.append({
+            "type": "propose",
+            "name": name,
+            "subagent": subagent,
+            "description": desc,
+            "content": content.strip(),
+        })
+
     return ops
 
 
@@ -334,4 +412,5 @@ def _strip_thinking(text: str) -> str:
     text = re.sub(
         r"<execute_skill\s+.*?>.*?</execute_skill>", "", text, flags=re.DOTALL
     )
+    text = re.sub(r"<propose_skill\s+.*?>.*?</propose_skill>", "", text, flags=re.DOTALL)
     return text.strip()
