@@ -11,7 +11,7 @@ ExecStart=/home/ubuntu/.local/bin/uv run python -m agent.main --no-cli
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
-Environment=PATH=/%PATH%/%TO%/%CLAUDE%/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/home/ubuntu/.nvm/versions/node/v24.14.0/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=multi-user.target

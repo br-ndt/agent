@@ -18,15 +18,24 @@ def build_providers(cfg: Config) -> dict[str, BaseProvider]:
     # Claude CLI provider — uses your Pro/Max subscription (no API key needed)
     if shutil.which("claude"):
         from .claude_cli import ClaudeCLIProvider
-        # Text-only version (for orchestrator if needed)
+
+        # Text-only (orchestrator) — no sandbox needed, can't write
         providers["claude_cli"] = ClaudeCLIProvider(
             disallowed_tools=["Bash", "Read", "Write", "Edit", "ListDir",
                               "Grep", "Glob", "WebSearch", "WebFetch"],
         )
-        # Tool-enabled version (for coder subagent)
+
+        # Tool-enabled claudes — sandboxed, can't escape workspace
         providers["claude_cli_tools"] = ClaudeCLIProvider(
-            allowed_tools=["Bash", "Write", "Read", "Edit"],
+            docker_image="agent-coder",
+            disallowed_tools=["WebSearch", "WebFetch"],  # Allow coding tools, disallow internet access
             timeout=300,
+        )
+
+        providers["claude_cli_research"] = ClaudeCLIProvider(
+            docker_image="agent-coder",
+            allowed_tools=["WebSearch", "WebFetch", "Read"],
+            timeout=120,
         )
     else:
         log.debug("claude_cli_not_available",
@@ -70,6 +79,11 @@ def build_resilient_providers(cfg: Config) -> dict[str, BaseProvider]:
         # Pick a fallback that's different from the primary
         fb = fallback_provider if fallback_provider is not provider else None
         fb_model = fallback_model if fb else ""
+
+        # Docker-sandboxed providers must not fall back to unsandboxed ones
+        if hasattr(provider, 'docker_image') and provider.docker_image:
+            fb = None
+            fb_model = ""
 
         # Claude CLI gets longer timeout (subprocess overhead)
         timeout = 180.0 if name == "claude_cli" else 120.0

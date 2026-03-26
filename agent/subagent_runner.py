@@ -13,6 +13,8 @@ from agent.config import SubagentConfig
 from agent.providers.base import BaseProvider
 from agent.tools.bash import BashTool
 from agent.tools.file_ops import FileOpsTool
+from agent.tools.web_fetch import WebFetchTool
+from agent.tools.web_browser import WebBrowserTool
 
 log = structlog.get_logger()
 
@@ -94,6 +96,34 @@ TOOL_DEFINITIONS = {
             },
         },
     },
+    "web_fetch": {
+        "name": "web_fetch",
+        "description": "Fetch a URL and return simplified text content from the page. Good for simple HTML sites.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL of the page to fetch",
+                }
+            },
+            "required": ["url"],
+        },
+    },
+    "web_browser": {
+        "name": "web_browser",
+        "description": "Fetch a URL using a full browser (Playwright). Handles JavaScript and dynamic content.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL of the page to fetch",
+                }
+            },
+            "required": ["url"],
+        },
+    },
 }
 
 
@@ -114,6 +144,8 @@ class SubagentRunner:
         has_tools = bool(self.config.tools)
         bash_tool = None
         file_tool = None
+        web_tool = None
+        browser_tool = None
         workspace = None
 
         if has_tools:
@@ -130,23 +162,34 @@ class SubagentRunner:
                 )
             if "file_ops" in self.config.tools:
                 file_tool = FileOpsTool(workspace=workspace)
+            if "web_fetch" in self.config.tools:
+                web_tool = WebFetchTool()
+            if "web_browser" in self.config.tools:
+                browser_tool = WebBrowserTool()
 
         # Build tool instruction block for the USER message (not system)
         # This ensures the LLM sees it regardless of provider system prompt behavior
         if has_tools:
             available = []
+            if browser_tool:
+                available.append("web_browser(url) — fetch content via full browser (handles JS, dynamic content, SPA)")
+            if web_tool:
+                available.append("web_fetch(url) — fast, simple HTML fetch (use for basic articles/blogs)")
             if bash_tool:
                 available.append("bash(command) — run shell commands")
             if file_tool:
                 available.append("read_file(path), write_file(path, content), edit_file(path, old, new), list_files(path)")
 
             tool_preamble = (
-                "You have access to tools in your workspace. To use a tool, respond with ONLY a JSON block like this:\n"
+                "## Tool Use Instructions\n"
+                "You have access to tools in your workspace. To use a tool, you MUST respond with "
+                "a JSON block like this and NOTHING ELSE in that message:\n"
                 '```tool\n{"tool": "tool_name", "args": {"key": "value"}}\n```\n\n'
                 "Available tools:\n" + "\n".join(f"- {t}" for t in available) +
                 f"\n\nYour workspace is: {workspace}\n"
-                "Use tools to complete the task. After each tool call, you'll see the result. "
-                "When done, respond normally without any tool blocks.\n\n"
+                "IMPORTANT: For modern web apps (React, Vue, etc.), ALWAYS prefer `web_browser`. "
+                "After each tool call, you will see the result. When you have enough information to "
+                "answer the user, respond normally without any tool blocks.\n\n"
                 "TASK:\n"
             )
             prompt = tool_preamble + prompt
@@ -176,11 +219,13 @@ class SubagentRunner:
 
             # If no tools, or response doesn't contain tool calls, we're done
             if not has_tools:
+                log.info("subagent_response", agent=self.config.name, content_len=len(response.content), content=response)
                 return response.content
 
             tool_call = _extract_tool_call(response.content)
             if not tool_call:
                 # No tool call in response — agent is done
+                log.info("subagent_response", agent=self.config.name, content_len=len(response.content), content=response)
                 return response.content
 
             # Execute the tool
@@ -193,7 +238,7 @@ class SubagentRunner:
                      args_keys=list(args.keys()))
 
             result = await self._execute_tool(
-                tool_name, args, bash_tool, file_tool
+                tool_name, args, bash_tool, file_tool, web_tool, browser_tool
             )
 
             # Add the assistant response and tool result to history
@@ -205,6 +250,7 @@ class SubagentRunner:
 
         # Max turns reached
         log.warning("subagent_max_turns", agent=self.config.name, turns=MAX_TURNS)
+        log.info("subagent_response", agent=self.config.name, content_len=len(response.content), content=response)
         return response.content
 
     async def _execute_tool(
@@ -213,6 +259,8 @@ class SubagentRunner:
         args: dict,
         bash_tool: BashTool | None,
         file_tool: FileOpsTool | None,
+        web_tool: WebFetchTool | None,
+        browser_tool: WebBrowserTool | None,
     ) -> dict:
         """Execute a tool call and return the result."""
         try:
@@ -228,6 +276,10 @@ class SubagentRunner:
                 )
             elif tool_name == "list_files" and file_tool:
                 return await file_tool.list_files(args.get("path", "."))
+            elif tool_name == "web_fetch" and web_tool:
+                return await web_tool.fetch(args.get("url", ""))
+            elif tool_name == "web_browser" and browser_tool:
+                return await browser_tool.fetch(args.get("url", ""))
             else:
                 return {"error": f"Unknown or unavailable tool: {tool_name}"}
         except Exception as e:

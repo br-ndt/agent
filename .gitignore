@@ -4,7 +4,18 @@ __pycache__/
 *.pyc
 .venv/
 .ruff_cache/
+
+# Local overrides and sensitive info
 personas/*.md
 !personas/README.md
 config.yaml
+
+# Agent output
 workspaces/
+
+# Auth credentials for Docker container
+docker/.claude.json
+docker/claude/
+
+# Docker build cache (if any)
+docker/tmp/

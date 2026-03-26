@@ -11,6 +11,7 @@ from agent.adapters import cli as cli_adapter, discord as discord_adapter
 from agent.config import load_config
 from agent.orchestrator import Orchestrator
 from agent.personas import load_personas, apply_persona
+from agent.skills import load_skills
 from agent.providers import build_providers, build_resilient_providers
 from agent.router import Router
 from agent.session_store import SessionStore
@@ -44,6 +45,7 @@ async def main():
 
     log.info("providers_ready", providers=list(providers.keys()))
     personas = load_personas()
+    skills = load_skills()
 
     # ── Build subagent runners ────────────────────────────────
     subagent_runners: dict[str, SubagentRunner] = {}
@@ -52,6 +54,17 @@ async def main():
             # Inject persona into the subagent's personality
             if name in personas:
                 sa_cfg.personality = apply_persona(sa_cfg.personality, personas[name])
+
+            # Inject skills relevant to this subagent
+            relevant_skills = [s for s in skills if s.subagent == name]
+            if relevant_skills:
+                skill_blocks = []
+                for s in relevant_skills:
+                    skill_blocks.append(f"### Skill: {s.name}\n{s.description}\n\n{s.content}")
+                
+                sa_cfg.personality += "\n\n## Skills\n" + "\n\n---\n\n".join(skill_blocks)
+                log.info("skills_injected", agent=name, count=len(relevant_skills))
+
             subagent_runners[name] = SubagentRunner(sa_cfg, providers[sa_cfg.provider])
             log.info("subagent_registered",
                     name=name, provider=sa_cfg.provider, model=sa_cfg.model,
@@ -84,6 +97,7 @@ async def main():
         subagent_runners=subagent_runners,
         providers=providers,
         session_store=session_store,
+        skills=skills,
     )
 
     # ── Build router ──────────────────────────────────────────
@@ -98,9 +112,16 @@ async def main():
 
     # Discord adapter (if token provided)
     if cfg.discord_bot_token:
+        # Use cheapest provider for relevance filtering
+        relevance_provider = providers.get("google", next(iter(providers.values())))
+
         discord_bot = discord_adapter.DiscordAdapter(
             token=cfg.discord_bot_token,
             allowed_ids=cfg.admin_ids | cfg.trusted_ids or None,
+            other_bot_ids=cfg.other_bot_ids if hasattr(cfg, 'other_bot_ids') else None,
+            relevance_provider=relevance_provider,
+            relevance_model="gemini-2.5-flash",
+            other_bots=cfg.other_bots,
         )
         router.register_adapter("discord", discord_bot)
         adapter_tasks.append(discord_bot.start(router.handle_message))
