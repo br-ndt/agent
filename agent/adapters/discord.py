@@ -10,14 +10,24 @@ import discord
 import structlog
 
 from .base import BaseAdapter, IncomingMessage
+from agent.providers import BaseProvider
+from agent.relevance import RelevanceFilter
 
 log = structlog.get_logger()
 
 
 class DiscordAdapter(BaseAdapter):
-    def __init__(self, token: str, allowed_ids: set[str] | None = None):
+    def __init__(self, token: str, allowed_ids: set[str] | None = None,
+                 other_bot_ids: list[str] | None = None,
+                 relevance_provider: BaseProvider | None = None,
+                 relevance_model: str = "gemini-2.5-flash",
+                 other_bots: dict[str, str] | None = None):
         self.token = token
         self.allowed_ids = allowed_ids
+        self.relevance_provider = relevance_provider
+        self.relevance_model = relevance_model
+        self.other_bots = other_bots or {}
+        self._relevance_filter = None
 
         intents = discord.Intents.default()
         intents.message_content = True  # Required to read message text
@@ -32,6 +42,15 @@ class DiscordAdapter(BaseAdapter):
 
         @self.client.event
         async def on_ready():
+            if self.relevance_provider:
+                self._relevance_filter = RelevanceFilter(
+                    bot_name=self.client.user.display_name,
+                    bot_id=str(self.client.user.id),
+                    provider=self.relevance_provider,
+                    model=self.relevance_model,
+                    other_bot_names=self.other_bots,
+                )
+                log.info("relevance_filter_enabled")
             log.info("discord_connected",
                      user=str(self.client.user),
                      guilds=len(self.client.guilds))
@@ -67,11 +86,32 @@ class DiscordAdapter(BaseAdapter):
 
                 if bot_role_ids.intersection(pinged_role_ids):
                     is_role_mentioned = True
-                    log.info("bot_role_pinged")
+                    log.info("bot_role_pinged") 
 
-            # Bail out if it's not a DM, not a direct mention, and not a role ping
-            if not is_dm and not is_mentioned and not is_role_mentioned:
-                return
+            # Relevance filter — replaces the simple bail-out check
+            if self._relevance_filter:
+                relevant, action = await self._relevance_filter.is_relevant(
+                    IncomingMessage(
+                        platform="discord",
+                        sender_id=str(message.author.id),
+                        sender_name=message.author.display_name,
+                        text=message.content,
+                        chat_id=str(message.channel.id),
+                    ),
+                    is_dm=is_dm,
+                    is_mentioned=is_mentioned or is_role_mentioned,
+                )
+
+                if not relevant:
+                    return
+
+                if action == "wait":
+                    await message.channel.send("Got it, standing by.")
+                    return
+            else:
+                # Fallback if no relevance filter configured
+                if not is_dm and not is_mentioned and not is_role_mentioned:
+                    return
 
             # Strip the direct bot mentions
             text = message.content

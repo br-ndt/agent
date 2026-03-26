@@ -33,6 +33,7 @@ class Config:
     # Chat adapters
     telegram_bot_token: str = ""
     discord_bot_token: str = ""
+    other_bots: dict[str, str] = field(default_factory=dict)
 
     # Access control
     admin_ids: set[str] = field(default_factory=set)
@@ -117,6 +118,7 @@ def _apply_yaml(cfg: Config, raw: dict):
                 "provider": routing.get("provider", cfg.orchestrator_provider),
                 "model": routing.get("model", cfg.orchestrator_model),
             }
+    cfg.other_bots = raw.get("access", {}).get("other_bots", {}) or {}
 
 
 def _apply_defaults(cfg: Config):

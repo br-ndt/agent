@@ -43,38 +43,48 @@ MODEL_ALIASES = {
 class ClaudeCLIProvider(BaseProvider):
     """Calls Claude via the CLI subprocess using your subscription."""
 
-    def __init__(self, timeout: int = 300, allowed_tools: list[str] | None = None, disallowed_tools: list[str] | None = None, cwd: str | None = None):
+    def __init__(self, timeout: int = 300, allowed_tools: list[str] | None = None, disallowed_tools: list[str] | None = None, cwd: str | None = None, docker_image=None):
         self.timeout = timeout
         self.allowed_tools = allowed_tools or []
         self.disallowed_tools = disallowed_tools or []
         self.cwd = cwd
+        self.docker_image = docker_image
 
-    async def complete(
-        self,
-        messages: list[dict],
-        system: str = "",
-        model: str = "sonnet",
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        tools: list[dict] | None = None,
-        cwd: str | None = None
-    ) -> LLMResponse:
+    async def complete(self, messages, system="", model="sonnet",
+                       max_tokens=4096, temperature=0.7, tools=None,
+                       cwd=None, **kwargs) -> LLMResponse:
         cli_model = MODEL_ALIASES.get(model, model)
 
-        cmd = [
-            "claude",
-            "-p",
+        # Build base command
+        base_cmd = [
+            "claude", "-p",
             "--output-format", "json",
             "--model", cli_model,
         ]
 
         if self.allowed_tools:
-            cmd.extend(["--allowedTools", " ".join(self.allowed_tools)])
+            base_cmd.extend(["--allowedTools", " ".join(self.allowed_tools)])
         if self.disallowed_tools:
-            cmd.extend(["--disallowedTools", " ".join(self.disallowed_tools)])
-
+            base_cmd.extend(["--disallowedTools", " ".join(self.disallowed_tools)])
         if system:
-            cmd.extend(["--system-prompt", system])
+            base_cmd.extend(["--system-prompt", system])
+
+        # Wrap in Docker if configured
+        if self.docker_image:
+            workspace = cwd or "/tmp"
+            cmd = [
+                "docker", "run", "--rm", "-i",
+                "-v", f"{workspace}:/workspace",
+                "-v", "/home/ubuntu/agent/docker/.claude.json:/home/coder/.claude.json:ro",
+                "-v", "/home/ubuntu/agent/docker/claude:/home/coder/.claude:ro",
+                "-w", "/workspace",
+                "--user", "coder",
+                "--memory=512m",
+                "--cpus=1",
+                self.docker_image,
+            ] + base_cmd
+        else:
+            cmd = base_cmd
 
         prompt = _flatten_messages(messages)
 
@@ -82,7 +92,8 @@ class ClaudeCLIProvider(BaseProvider):
             # Strip ANTHROPIC_API_KEY from the subprocess environment
             # so the CLI uses OAuth (your subscription) instead of the API
             import os
-            env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+            env = {k: v for k, v in os.environ.items()
+                   if k != "ANTHROPIC_API_KEY"}
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,

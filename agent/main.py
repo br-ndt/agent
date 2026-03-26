@@ -112,9 +112,16 @@ async def main():
 
     # Discord adapter (if token provided)
     if cfg.discord_bot_token:
+        # Use cheapest provider for relevance filtering
+        relevance_provider = providers.get("google", next(iter(providers.values())))
+
         discord_bot = discord_adapter.DiscordAdapter(
             token=cfg.discord_bot_token,
             allowed_ids=cfg.admin_ids | cfg.trusted_ids or None,
+            other_bot_ids=cfg.other_bot_ids if hasattr(cfg, 'other_bot_ids') else None,
+            relevance_provider=relevance_provider,
+            relevance_model="gemini-2.5-flash",
+            other_bots=cfg.other_bots,
         )
         router.register_adapter("discord", discord_bot)
         adapter_tasks.append(discord_bot.start(router.handle_message))
