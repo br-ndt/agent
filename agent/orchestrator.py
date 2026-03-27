@@ -6,11 +6,13 @@ import re
 import time
 from typing import Callable, Awaitable
 
+import yaml
 import structlog
 
 from agent.config import Config
 from agent.cost_tracker import CostTracker
 from agent.providers.base import BaseProvider
+from agent.providers.vision import VisionProvider
 from agent.session_store import SessionStore, PersistentSession
 from agent.subagent_runner import SubagentRunner
 from agent.skills import (
@@ -18,6 +20,7 @@ from agent.skills import (
     SkillRegistry,
     SkillExecutor,
     SkillRun,
+    _dict_to_step,
     save_skill,
     save_proposed_skill,
     load_skills,
@@ -36,12 +39,15 @@ class Orchestrator:
         session_store: SessionStore | None = None,
         skills: list[Skill] | None = None,
         cost_tracker: CostTracker | None = None,
+        vision_provider: VisionProvider | None = None,
     ):
         self.provider = provider
         self.providers = providers or {}
         self.config = config
         self.subagents = subagent_runners
         self.cost_tracker = cost_tracker
+        self.vision_provider = vision_provider
+
         self.sessions: dict[str, PersistentSession] = {}
         self.session_store = session_store
         self.skill_registry = SkillRegistry(
@@ -59,47 +65,50 @@ class Orchestrator:
         """Dynamically build the system prompt with current subagents and skills."""
         agent_list = ", ".join(self.subagents.keys()) if self.subagents else "none"
         skill_catalog = self.skill_registry.build_catalog()
-    
+
         prompt = self.config.orchestrator_system_prompt.replace(
             "{subagent_list}", agent_list
         )
         # Remove old {skill_list} placeholder if present
         prompt = prompt.replace("{skill_list}", "see below")
-    
+
+        vision_instructions = ""
+        if self.vision_provider:
+            vision_instructions = (
+                "\n\n## Vision Capabilities\n"
+                "You can analyze and generate images:\n"
+                "- <analyze_image>prompt for analysis</analyze_image> — analyze images from user uploads\n"
+                '- <generate_image aspect_ratio="1:1">description</generate_image> — generate images (aspect_ratio: 1:1, 16:9, 9:16, 4:3, 3:4)\n'
+                "- <edit_image>editing instruction</edit_image> — edit the most recently uploaded/generated image\n\n"
+                "Vision triggers: user uploads image, asks to 'describe', 'analyze', 'read', 'generate image', 'create picture', 'draw'.\n"
+            )
+
         return (
             "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
             "execute code, or use any tools. When a task requires code, files, web pages, or commands, "
             "delegate it to a subagent. Just respond with text.\n\n"
-    
             "## Synthesis Rule\n"
             "When a subagent like 'researcher' reports the content of a page, do not summarize "
             "it too heavily if the user's intent was to see what's on the page. "
             "Provide a thorough report of the actual contents found.\n\n"
-    
             "## Skill System\n"
             "You can learn and execute skills.\n\n"
-    
             "### Executing a skill\n"
             "When a user's request matches a known skill (check triggers below), delegate using:\n"
             '<execute_skill name="skill_name">any additional context from the user</execute_skill>\n\n'
-    
             "For skills WITH structured steps, the system will execute each step automatically — "
             "you don't need to break down the task. Just trigger the skill.\n\n"
-    
             "For skills WITHOUT structured steps, the skill's instructions will be sent to the "
             "appropriate subagent.\n\n"
-    
             "### Learning a new skill\n"
             'To learn a skill, emit: <learn_skill name="name" subagent="subagent_name" '
             'description="short desc">markdown instructions</learn_skill>\n\n'
-    
             "### Proposing a structured skill\n"
             "When a user says something like 'make that a skill' after a multi-step conversation, "
             'emit: <propose_skill name="name" subagent="subagent_name" '
             'description="short desc">YAML steps list</propose_skill>\n\n'
-    
             f"## Available Skills\n{skill_catalog}\n\n"
-            + prompt
+            f"{vision_instructions}" + prompt
         )
 
     async def handle(
@@ -109,8 +118,22 @@ class Orchestrator:
         reply_fn: Callable[[str], Awaitable[None]],
         tier: str = "admin",
         tier_route: dict[str, str] | None = None,
-    ) -> str:
-        """Handle a user message. May delegate to subagents."""
+        images: list[dict] | None = None,
+    ) -> dict:
+        """Handle a user message. May delegate to subagents or vision operations.
+        
+        Returns:
+            dict with keys:
+                - 'text': str (the text response)
+                - 'images': list[bytes] (any generated/edited images)
+        """
+        # Helper to build return dict
+        def make_result(text: str, generated_images: list[bytes] | None = None) -> dict:
+            return {
+                'text': text,
+                'images': generated_images or []
+            }
+        
         # Resolve provider+model for this tier
         route = tier_route or {}
         provider_name = route.get("provider", self.config.orchestrator_provider)
@@ -126,6 +149,7 @@ class Orchestrator:
             tier=tier,
             tier_route=tier_route,
             providers_keys=list(self.providers.keys()),
+            has_images=bool(images),
         )
 
         if session_id not in self.sessions:
@@ -140,7 +164,11 @@ class Orchestrator:
 
         await session.ensure_loaded()
 
-        history = self.sessions[session_id]
+        # Store images in session context if provided
+        if images:
+            session.images = images
+            log.info("images_received", count=len(images))
+
         await session.add_message("user", user_msg)
 
         start = time.monotonic()
@@ -172,15 +200,86 @@ class Orchestrator:
         # Check for delegation blocks
         delegations = _parse_delegations(response.content)
         skill_ops = _parse_skill_ops(response.content)
+        vision_ops = _parse_vision_ops(response.content)
 
-        if not delegations and not skill_ops:
+        if not delegations and not skill_ops and not vision_ops:
             # Direct response — no delegation needed
             final = _strip_thinking(response.content)
             await session.add_message("assistant", final)
-            return final
+            return make_result(final)
 
-        # --- Handle Skill Operations ---
+        # ── Handle Vision Operations ────────────────────────────────
+        vision_results = []
+        generated_images = []  # Track images generated this turn
+        
+        if vision_ops and self.vision_provider:
+            for op in vision_ops:
+                try:
+                    if op["type"] == "analyze":
+                        if not images:
+                            vision_results.append(
+                                "[Vision] ERROR: No images provided for analysis"
+                            )
+                            continue
+
+                        if len(images) == 1:
+                            result = await self.vision_provider.analyze_image(
+                                image_data=images[0]["data"],
+                                prompt=op["prompt"],
+                                mime_type=images[0].get("mime_type", "image/jpeg"),
+                            )
+                        else:
+                            result = await self.vision_provider.analyze_multiple_images(
+                                images=images, prompt=op["prompt"]
+                            )
+
+                        vision_results.append(f"[Vision Analysis]\n{result}")
+                        log.info("vision_analysis_complete", prompt=op["prompt"][:50])
+
+                    elif op["type"] == "generate":
+                        gen_images = await self.vision_provider.generate_image(
+                            prompt=op["prompt"],
+                            aspect_ratio=op.get("aspect_ratio", "1:1"),
+                            num_images=1,
+                        )
+
+                        # Store for editing and return
+                        session.last_generated_image = gen_images[0]
+                        generated_images.append(gen_images[0])
+
+                        # Don't add to vision_results - image speaks for itself
+                        # Don't call reply_fn - let the image be the response
+                        log.info("vision_generation_complete", prompt=op["prompt"][:50])
+
+                    elif op["type"] == "edit":
+                        base_image = getattr(session, "last_generated_image", None)
+                        if not base_image and images:
+                            base_image = images[-1]["data"]
+
+                        if not base_image:
+                            vision_results.append(
+                                "[Vision] ERROR: No image available for editing"
+                            )
+                            continue
+
+                        edited = await self.vision_provider.edit_image(
+                            base_image=base_image, edit_prompt=op["prompt"]
+                        )
+
+                        session.last_generated_image = edited[0]
+                        generated_images.append(edited[0])
+                        
+                        # Don't add to vision_results - image speaks for itself
+                        log.info("vision_edit_complete", prompt=op["prompt"][:50])
+
+                except Exception as e:
+                    vision_results.append(f"[Vision] ERROR: {type(e).__name__}: {e}")
+                    log.error("vision_operation_failed", type=op["type"], error=str(e))
+
+        # ── Handle Skill Operations ─────────────────────────────────
         skill_results = []
+        structured_skill_ran = False
+
         for op in skill_ops:
             if op["type"] == "learn":
                 try:
@@ -218,6 +317,7 @@ class Orchestrator:
                         # Structured skill — use the executor
                         subagent = self.subagents.get(skill.subagent)
                         if subagent:
+                            structured_skill_ran = True
                             run = await self.skill_executor.execute(
                                 skill=skill,
                                 task_context=op["task"],
@@ -226,32 +326,41 @@ class Orchestrator:
                                 triggered_by=session_id,
                                 progress_fn=reply_fn,
                             )
-                            result_text = self.skill_executor.format_run_result(skill, run)
-                            skill_results.append(f"[Skill: {skill.name}] {result_text}")
+                            result_text = self.skill_executor.format_run_result(
+                                skill, run
+                            )
+                            skill_results.append(result_text)
                         else:
                             skill_results.append(
                                 f"[Skill System] ERROR: Subagent '{skill.subagent}' not found for skill '{skill.name}'"
                             )
                     else:
                         # Unstructured skill — delegate like before
-                        delegations.append({
-                            "agent": skill.subagent,
-                            "task": f"Using your skill '{skill.name}', perform the following task: {op['task']}",
-                        })
-                        log.info("skill_execution_triggered", name=skill.name, agent=skill.subagent)
+                        delegations.append(
+                            {
+                                "agent": skill.subagent,
+                                "task": f"Using your skill '{skill.name}', perform the following task: {op['task']}",
+                            }
+                        )
+                        log.info(
+                            "skill_execution_triggered",
+                            name=skill.name,
+                            agent=skill.subagent,
+                        )
                 else:
-                    skill_results.append(f"[Skill System] ERROR: Skill '{op['name']}' not found.")
+                    skill_results.append(
+                        f"[Skill System] ERROR: Skill '{op['name']}' not found."
+                    )
                     log.warning("skill_not_found", name=op["name"])
 
             elif op["type"] == "propose":
                 try:
-                    # Parse the YAML steps from the content
                     steps_data = yaml.safe_load(op["content"])
                     steps = []
                     if isinstance(steps_data, list):
                         for sd in steps_data:
                             steps.append(_dict_to_step(sd))
-            
+
                     new_skill = Skill(
                         name=op["name"],
                         subagent=op["subagent"],
@@ -269,21 +378,31 @@ class Orchestrator:
                 except Exception as e:
                     skill_results.append(f"[Skill System] ERROR proposing skill: {e}")
 
-        # Delegation mode: fan out to subagents in parallel
+        # ── Delegation ──────────────────────────────────────────────
         valid_delegations = [d for d in delegations if d["agent"] in self.subagents]
 
-        if not valid_delegations and not skill_results:
+        # --- Fast path: vision/skill work already done, no other delegation ---
+        if (vision_results or skill_results or generated_images) and not valid_delegations:
+            # If we only generated images with no analysis/errors, send empty text
+            if generated_images and not vision_results and not skill_results:
+                final = ""
+            else:
+                final = "\n\n".join(vision_results + skill_results)
+            
+            if final:
+                await session.add_message("assistant", final)
+            return make_result(final, generated_images)
+
+        if not valid_delegations and not skill_results and not vision_results:
             # Orchestrator tried to delegate to unknown agents — just return raw
             final = _strip_thinking(response.content)
             await session.add_message("assistant", final)
-            return final
+            return make_result(final)
 
-        agent_names = [d["agent"] for d in valid_delegations]
-        all_ops_desc = ", ".join(
-            agent_names
-            + [f"Skill:{op['name']}" for op in skill_ops if op["type"] == "learn"]
-        )
-        await reply_fn(f"Working on it — delegating to {all_ops_desc}...")
+        # --- We have subagent delegations to run ---
+        if valid_delegations and not structured_skill_ran and not vision_results:
+            agent_names = [d["agent"] for d in valid_delegations]
+            await reply_fn(f"Working on it — delegating to {', '.join(agent_names)}...")
 
         # Run subagents concurrently
         tasks = [
@@ -292,8 +411,8 @@ class Orchestrator:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Format results for synthesis
-        result_parts = skill_results  # Include any skill learning successes/errors
+        # ── Synthesis decision ──────────────────────────────────────
+        result_parts = list(vision_results) + list(skill_results)
         for d, result in zip(valid_delegations, results):
             if isinstance(result, Exception):
                 result_parts.append(
@@ -303,40 +422,56 @@ class Orchestrator:
             else:
                 result_parts.append(f"[{d['agent']}] Result:\n{result}")
 
-        synthesis_msg = (
-            "Here are the results from the subagents you delegated to:\n\n"
-            + "\n\n---\n\n".join(result_parts)
-            + "\n\nPlease synthesize these into a clear, final response for the user."
+        has_errors = any(isinstance(r, Exception) for r in results)
+        needs_synthesis = (
+            len(valid_delegations) > 1
+            or (skill_results and valid_delegations)
+            or (vision_results and valid_delegations)
+            or has_errors
         )
 
-        # Second pass: synthesize
-        await session.add_message("assistant", response.content)
-        await session.add_message("user", synthesis_msg)
-
-        final_response = await provider.complete(
-            messages=session.get_messages_for_llm(),
-            system=self.get_system_prompt(),
-            model=model,
-            max_tokens=self.config.orchestrator_max_tokens,
-        )
-        if self.cost_tracker:
-            await self.cost_tracker.log_call(
-                provider=provider_name,
-                model=model,
-                usage=response.usage,
-                session_id=session_id,
-                agent="orchestrator",
-                duration_ms=int((time.monotonic() - start) * 1000),
+        if needs_synthesis:
+            synthesis_msg = (
+                "Here are the results from the subagents you delegated to:\n\n"
+                + "\n\n---\n\n".join(result_parts)
+                + "\n\nPlease synthesize these into a clear, final response for the user."
             )
 
-        final = _strip_thinking(final_response.content)
-        await session.add_message("assistant", final)
+            await session.add_message("assistant", response.content)
+            await session.add_message("user", synthesis_msg)
 
-        return final
+            synth_start = time.monotonic()
+            final_response = await provider.complete(
+                messages=session.get_messages_for_llm(),
+                system=self.get_system_prompt(),
+                model=model,
+                max_tokens=self.config.orchestrator_max_tokens,
+            )
+            if self.cost_tracker:
+                await self.cost_tracker.log_call(
+                    provider=provider_name,
+                    model=model,
+                    usage=final_response.usage,
+                    session_id=session_id,
+                    agent="orchestrator",
+                    duration_ms=int((time.monotonic() - synth_start) * 1000),
+                )
+
+            final = _strip_thinking(final_response.content)
+        else:
+            # Single clean result — pass through directly
+            if valid_delegations and not isinstance(results[0], Exception):
+                final = results[0]
+            else:
+                final = "\n\n".join(result_parts)
+
+            await session.add_message("assistant", response.content)
+
+        await session.add_message("assistant", final)
+        return make_result(final, generated_images)
 
     def _make_summarizer(self):
         """Create a cheap summarizer function for session compression."""
-        # Prefer Google (cheapest), fall back to default provider
         summarize_provider = self.providers.get("google", self.provider)
         summarize_model = (
             "gemini-2.5-flash"
@@ -369,10 +504,9 @@ def _parse_delegations(text: str) -> list[dict]:
 
 
 def _parse_skill_ops(text: str) -> list[dict]:
-    """Extract <learn_skill> and <execute_skill> blocks."""
+    """Extract <learn_skill>, <execute_skill>, and <propose_skill> blocks."""
     ops = []
 
-    # <learn_skill name="..." subagent="..." description="...">markdown</learn_skill>
     learn_pattern = r'<learn_skill\s+name="([^"]+)"\s+subagent="([^"]+)"\s+description="([^"]*)">(.*?)</learn_skill>'
     for name, subagent, desc, content in re.findall(learn_pattern, text, re.DOTALL):
         ops.append(
@@ -385,21 +519,48 @@ def _parse_skill_ops(text: str) -> list[dict]:
             }
         )
 
-    # <execute_skill name="...">task</execute_skill>
     exec_pattern = r'<execute_skill\s+name="([^"]+)">(.*?)</execute_skill>'
     for name, task in re.findall(exec_pattern, text, re.DOTALL):
         ops.append({"type": "execute", "name": name, "task": task.strip()})
 
-    # <propose_skill name="..." subagent="..." description="...">YAML steps</propose_skill>
-    propose_pattern = r'<propose_skill\\s+name="([^"]+)"\\s+subagent="([^"]+)"\\s+description="([^"]*)">(.*?)</propose_skill>'
+    propose_pattern = r'<propose_skill\s+name="([^"]+)"\s+subagent="([^"]+)"\s+description="([^"]*)">(.*?)</propose_skill>'
     for name, subagent, desc, content in re.findall(propose_pattern, text, re.DOTALL):
-        ops.append({
-            "type": "propose",
-            "name": name,
-            "subagent": subagent,
-            "description": desc,
-            "content": content.strip(),
-        })
+        ops.append(
+            {
+                "type": "propose",
+                "name": name,
+                "subagent": subagent,
+                "description": desc,
+                "content": content.strip(),
+            }
+        )
+
+    return ops
+
+
+def _parse_vision_ops(text: str) -> list[dict]:
+    """Extract <analyze_image>, <generate_image>, and <edit_image> blocks."""
+    ops = []
+
+    analyze_pattern = r"<analyze_image>(.*?)</analyze_image>"
+    for prompt in re.findall(analyze_pattern, text, re.DOTALL):
+        ops.append({"type": "analyze", "prompt": prompt.strip()})
+
+    generate_pattern = (
+        r'<generate_image(?:\s+aspect_ratio="([^"]+)")?>(.*?)</generate_image>'
+    )
+    for aspect_ratio, prompt in re.findall(generate_pattern, text, re.DOTALL):
+        ops.append(
+            {
+                "type": "generate",
+                "prompt": prompt.strip(),
+                "aspect_ratio": aspect_ratio or "1:1",
+            }
+        )
+
+    edit_pattern = r"<edit_image>(.*?)</edit_image>"
+    for prompt in re.findall(edit_pattern, text, re.DOTALL):
+        ops.append({"type": "edit", "prompt": prompt.strip()})
 
     return ops
 
@@ -412,5 +573,12 @@ def _strip_thinking(text: str) -> str:
     text = re.sub(
         r"<execute_skill\s+.*?>.*?</execute_skill>", "", text, flags=re.DOTALL
     )
-    text = re.sub(r"<propose_skill\s+.*?>.*?</propose_skill>", "", text, flags=re.DOTALL)
+    text = re.sub(
+        r"<propose_skill\s+.*?>.*?</propose_skill>", "", text, flags=re.DOTALL
+    )
+    text = re.sub(r"<analyze_image>.*?</analyze_image>", "", text, flags=re.DOTALL)
+    text = re.sub(
+        r"<generate_image(?:\s+[^>]*)?>.*?</generate_image>", "", text, flags=re.DOTALL
+    )
+    text = re.sub(r"<edit_image>.*?</edit_image>", "", text, flags=re.DOTALL)
     return text.strip()

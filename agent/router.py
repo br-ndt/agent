@@ -51,9 +51,11 @@ class Router:
             return
 
         # Admin commands
-        upper = msg.text.strip().upper()
+        raw_text = msg.text.split("[System Context:")[0].strip()
+        upper = raw_text.upper()
+
         if tier == "admin" and (
-            upper in ("RESTART", "HEALME", "STATUS", "COSTS", "SKILLS")
+            upper in ("RESTART", "HEALME", "STATUS", "COST", "COSTS", "SKILLS")
             or upper.startswith("SKILL ")
             or upper == "RELOAD SKILLS"
         ):
@@ -73,18 +75,59 @@ class Router:
         log.info("router_calling_orchestrator", platform=msg.platform)
         try:
             tier_route = self.config.tier_routing.get(tier, {})
+            
+            # Extract images from attachments
+            images = None
+            if msg.attachments:
+                images = []
+                for att in msg.attachments:
+                    if att.get("mime_type", "").startswith("image/"):
+                        images.append(
+                            {
+                                "data": att.get("data"),
+                                "mime_type": att["mime_type"],
+                                "filename": att.get("filename", "image"),
+                            }
+                        )
+                if not images:
+                    images = None
 
-            response = await self.orchestrator.handle(
+            # Call orchestrator (returns dict with text + images)
+            result = await self.orchestrator.handle(
                 session_id=f"{msg.platform}:{msg.sender_id}",
                 user_msg=msg.text,
                 reply_fn=reply_fn,
                 tier=tier,
                 tier_route=tier_route,
+                images=images,
             )
+            
+            # Handle response - orchestrator now returns dict
+            response_text = result.get('text', '')
+            generated_images = result.get('images', [])
+            
             log.info(
-                "router_got_response", platform=msg.platform, response_len=len(response)
+                "router_got_response", 
+                platform=msg.platform, 
+                response_len=len(response_text),
+                image_count=len(generated_images)
             )
-            await adapter.send(msg.chat_id, response)
+            
+            # Send text response (only if non-empty)
+            if response_text:
+                await adapter.send(msg.chat_id, response_text)
+            
+            # Send generated images if any
+            if generated_images:
+                if hasattr(adapter, 'send_images'):
+                    await adapter.send_images(msg.chat_id, generated_images)
+                else:
+                    log.warning(
+                        "adapter_missing_send_images", 
+                        platform=msg.platform,
+                        image_count=len(generated_images)
+                    )
+                    
         except Exception as e:
             log.error("orchestrator_error", error=str(e), exc_info=True)
             await adapter.send(msg.chat_id, f"Sorry, something went wrong: {e}")
@@ -94,7 +137,7 @@ class Router:
         if not adapter:
             return
 
-        cmd = msg.text.upper()
+        cmd = msg.text.split("[System Context:")[0].strip().upper()
         if cmd == "STATUS":
             session_count = len(self.orchestrator.sessions)
             await adapter.send(
@@ -109,7 +152,7 @@ class Router:
         elif cmd == "RESTART":
             await adapter.send(msg.chat_id, "Restarting...")
             raise SystemExit(0)
-        elif cmd == "COSTS":
+        elif cmd == "COST" or cmd == "COSTS":
             if (
                 hasattr(self.orchestrator, "cost_tracker")
                 and self.orchestrator.cost_tracker
@@ -134,9 +177,13 @@ class Router:
             proposed = self.orchestrator.skill_registry.list_proposed()
             lines = ["**Active Skills:**"]
             for s in active:
-                triggers = ", ".join(f"`{t}`" for t in s.triggers) if s.triggers else "none"
+                triggers = (
+                    ", ".join(f"`{t}`" for t in s.triggers) if s.triggers else "none"
+                )
                 steps_info = f" ({len(s.steps)} steps)" if s.has_steps else ""
-                lines.append(f"• **{s.name}**{steps_info} → {s.subagent} | Triggers: {triggers}")
+                lines.append(
+                    f"• **{s.name}**{steps_info} → {s.subagent} | Triggers: {triggers}"
+                )
             if proposed:
                 lines.append("\n**Proposed (awaiting approval):**")
                 for s in proposed:
@@ -150,13 +197,16 @@ class Router:
             await adapter.send(msg.chat_id, f"♻️ Reloaded {count} skill(s).")
         elif cmd.startswith("SKILL "):
             await self._handle_skill_subcommand(msg, adapter)
-    
 
-    async def _handle_skill_subcommand(self, msg: IncomingMessage, adapter: BaseAdapter):
+    async def _handle_skill_subcommand(
+        self, msg: IncomingMessage, adapter: BaseAdapter
+    ):
         parts = msg.text.strip().split(maxsplit=2)
-        # parts[0] = "SKILL", parts[1] = subcommand, parts[2] = skill name
         if len(parts) < 3:
-            await adapter.send(msg.chat_id, "Usage: SKILL INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN <name>")
+            await adapter.send(
+                msg.chat_id,
+                "Usage: SKILL INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN <name>",
+            )
             return
 
         subcmd = parts[1].upper()
@@ -185,13 +235,17 @@ class Router:
         elif subcmd == "APPROVE":
             if registry.approve(name):
                 self.orchestrator.skills = registry.list_active()
-                await adapter.send(msg.chat_id, f"✅ Skill '{name}' approved and activated.")
+                await adapter.send(
+                    msg.chat_id, f"✅ Skill '{name}' approved and activated."
+                )
             else:
                 await adapter.send(msg.chat_id, f"Proposed skill '{name}' not found.")
 
         elif subcmd == "REJECT":
             if registry.reject(name):
-                await adapter.send(msg.chat_id, f"❌ Skill '{name}' rejected and deleted.")
+                await adapter.send(
+                    msg.chat_id, f"❌ Skill '{name}' rejected and deleted."
+                )
             else:
                 await adapter.send(msg.chat_id, f"Proposed skill '{name}' not found.")
 
@@ -214,7 +268,9 @@ class Router:
             if runs:
                 lines = [f"**Recent runs for {name}:**"]
                 for r in runs[:5]:
-                    lines.append(f"• {r['status']} at {r['started_at']} ({r.get('error') or 'ok'})")
+                    lines.append(
+                        f"• {r['status']} at {r['started_at']} ({r.get('error') or 'ok'})"
+                    )
                 await adapter.send(msg.chat_id, "\n".join(lines))
             else:
                 await adapter.send(msg.chat_id, f"No run history for '{name}'.")
@@ -232,7 +288,12 @@ class Router:
                 result = self.orchestrator.skill_executor.format_run_result(skill, run)
                 await adapter.send(msg.chat_id, result)
             else:
-                await adapter.send(msg.chat_id, f"Skill '{name}' not found or subagent unavailable.")
+                await adapter.send(
+                    msg.chat_id, f"Skill '{name}' not found or subagent unavailable."
+                )
 
         else:
-            await adapter.send(msg.chat_id, f"Unknown: SKILL {subcmd}. Try INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN")
+            await adapter.send(
+                msg.chat_id,
+                f"Unknown: SKILL {subcmd}. Try INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN",
+            )

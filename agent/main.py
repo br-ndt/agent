@@ -1,6 +1,7 @@
 """Entry point — start adapters and orchestrator."""
 
 import asyncio
+import os
 import signal
 import sys
 
@@ -14,6 +15,7 @@ from agent.orchestrator import Orchestrator
 from agent.personas import load_personas, apply_persona
 from agent.skills import load_skills
 from agent.providers import build_providers, build_resilient_providers
+from agent.providers.vision import VisionProvider  # NEW
 from agent.router import Router
 from agent.session_store import SessionStore
 from agent.status_server import configure as configure_status, start_status_server
@@ -48,6 +50,18 @@ async def main():
     log.info("providers_ready", providers=list(providers.keys()))
     personas = load_personas()
     skills = load_skills()
+
+    # ── Vision provider (optional) ────────────────────────────
+    vision_provider = None
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+    if google_api_key:
+        try:
+            vision_provider = VisionProvider(api_key=google_api_key)
+            log.info("vision_provider_enabled")
+        except Exception as e:
+            log.warning("vision_provider_init_failed", error=str(e))
+    else:
+        log.info("vision_provider_disabled", hint="Set GOOGLE_API_KEY to enable")
 
     # ── Session store ─────────────────────────────────────────
     session_store = SessionStore()
@@ -118,6 +132,7 @@ async def main():
         session_store=session_store,
         skills=skills,
         cost_tracker=cost_tracker,
+        vision_provider=vision_provider,  # NEW
     )
 
     # ── Build router ──────────────────────────────────────────
@@ -175,6 +190,7 @@ async def main():
         adapters=list(router.adapters.keys()),
         subagents=list(subagent_runners.keys()),
         daemon_mode=daemon_mode,
+        vision_enabled=vision_provider is not None,
     )
 
     if daemon_mode:

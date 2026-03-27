@@ -14,6 +14,7 @@ Storage: SQLite (one row per session). Lightweight, no extra services.
 import json
 import time
 from pathlib import Path
+from typing import Callable
 
 import aiosqlite
 import structlog
@@ -21,9 +22,9 @@ import structlog
 log = structlog.get_logger()
 
 # Tuning knobs
-MAX_HOT = 40          # Messages kept in full detail
+MAX_HOT = 40  # Messages kept in full detail
 SUMMARIZE_CHUNK = 10  # How many old messages to summarize at once
-SAVE_INTERVAL = 30    # Auto-save every N seconds
+SAVE_INTERVAL = 30  # Auto-save every N seconds
 
 DB_PATH = Path(__file__).resolve().parent.parent / "state" / "sessions.db"
 
@@ -37,7 +38,8 @@ class SessionStore:
         """Create the DB and table if needed."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.db_path)
-        await self._db.execute("""
+        await self._db.execute(
+            """
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 summary TEXT DEFAULT '',
@@ -45,7 +47,8 @@ class SessionStore:
                 last_active REAL,
                 message_count INTEGER DEFAULT 0
             )
-        """)
+        """
+        )
         await self._db.commit()
         log.info("session_store_ready", db=str(self.db_path))
 
@@ -69,18 +72,25 @@ class SessionStore:
         except json.JSONDecodeError:
             history = []
 
-        log.debug("session_loaded", session_id=session_id,
-                  summary_len=len(summary), hot_messages=len(history))
+        log.debug(
+            "session_loaded",
+            session_id=session_id,
+            summary_len=len(summary),
+            hot_messages=len(history),
+        )
 
         return {"summary": summary, "history": history, "message_count": count}
 
-    async def save(self, session_id: str, summary: str, history: list[dict], message_count: int):
+    async def save(
+        self, session_id: str, summary: str, history: list[dict], message_count: int
+    ):
         """Persist a session."""
         if not self._db:
             return
 
         hot_json = json.dumps(history)
-        await self._db.execute("""
+        await self._db.execute(
+            """
             INSERT INTO sessions (session_id, summary, hot_messages, last_active, message_count)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
@@ -88,13 +98,17 @@ class SessionStore:
                 hot_messages = excluded.hot_messages,
                 last_active = excluded.last_active,
                 message_count = excluded.message_count
-        """, (session_id, summary, hot_json, time.time(), message_count))
+        """,
+            (session_id, summary, hot_json, time.time(), message_count),
+        )
         await self._db.commit()
 
     async def delete(self, session_id: str):
         """Delete a session."""
         if self._db:
-            await self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            await self._db.execute(
+                "DELETE FROM sessions WHERE session_id = ?", (session_id,)
+            )
             await self._db.commit()
 
     async def list_sessions(self) -> list[dict]:
@@ -125,7 +139,9 @@ class SessionStore:
 class PersistentSession:
     """Wraps a single user's conversation with summarization."""
 
-    def __init__(self, session_id: str, store: SessionStore, summarizer=None):
+    def __init__(
+        self, session_id: str, store: SessionStore, summarizer: Callable | None = None
+    ):
         self.session_id = session_id
         self.store = store
         self.summarizer = summarizer  # async fn(messages) -> str
@@ -134,6 +150,10 @@ class PersistentSession:
         self.history: list[dict] = []
         self.message_count: int = 0
         self._loaded = False
+
+        # Vision support
+        self.images: list[dict] = []
+        self.last_generated_image: bytes | None = None
 
     async def ensure_loaded(self):
         """Lazy-load from DB on first access."""
@@ -154,17 +174,21 @@ class PersistentSession:
         messages = []
 
         if self.summary:
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"[Previous conversation summary: {self.summary}]\n\n"
-                    "Continue from where we left off."
-                ),
-            })
-            messages.append({
-                "role": "assistant",
-                "content": "Understood, I have the context from our previous conversation. How can I help?",
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"[Previous conversation summary: {self.summary}]\n\n"
+                        "Continue from where we left off."
+                    ),
+                }
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Understood, I have the context from our previous conversation. How can I help?",
+                }
+            )
 
         messages.extend(self.history)
         return messages
@@ -200,10 +224,12 @@ class PersistentSession:
 
         try:
             self.summary = await self.summarizer(text)
-            log.info("session_summarized",
-                     session_id=self.session_id,
-                     summarized_messages=len(to_summarize),
-                     summary_len=len(self.summary))
+            log.info(
+                "session_summarized",
+                session_id=self.session_id,
+                summarized_messages=len(to_summarize),
+                summary_len=len(self.summary),
+            )
         except Exception as e:
             log.error("session_summarize_failed", error=str(e))
             # On failure, just truncate without summary
