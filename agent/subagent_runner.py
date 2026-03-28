@@ -229,7 +229,7 @@ class SubagentRunner:
         if "web_fetch" in self.config.tools:
             web_tool = WebFetchTool()
         if "web_browser" in self.config.tools:
-            browser_tool = WebBrowserTool()
+            browser_tool = WebBrowserTool(screenshot_dir=workspace / "_screenshots")
 
         # Build tool preamble
         available = []
@@ -319,12 +319,14 @@ class SubagentRunner:
             )
 
             messages.append({"role": "assistant", "content": response.content})
-            messages.append(
-                {
-                    "role": "user",
-                    "content": f"Tool result for `{tool_name}`:\n```\n{json.dumps(result, indent=2)}\n```",
-                }
-            )
+            tool_msg = {
+                "role": "user",
+                "content": f"Tool result for `{tool_name}`:\n```\n{json.dumps(result, indent=2)}\n```",
+            }
+            # Attach screenshot as image if present (multimodal providers can see it)
+            if "screenshot" in result:
+                tool_msg["images"] = [result["screenshot"]]
+            messages.append(tool_msg)
 
         log.warning("subagent_max_turns", agent=self.config.name, turns=MAX_TURNS)
         return response.content if response else ""

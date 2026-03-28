@@ -904,7 +904,11 @@ class SkillExecutor:
         )
 
     def format_run_result(self, skill: Skill, run: SkillRun) -> str:
-        """Format a skill run into a human-readable summary."""
+        """Format a skill run into a human-readable summary.
+
+        The final step's output is treated as the skill's deliverable and
+        included in full. Earlier steps are shown as status lines only.
+        """
         status_icon = {"success": "✅", "failed": "❌", "aborted": "⛔"}.get(
             run.status, "❓"
         )
@@ -914,21 +918,25 @@ class SkillExecutor:
         if run.error:
             lines.append(f"\n**Error:** {run.error}")
 
-        if skill.include_step_outputs and run.step_results:
+        if run.step_results:
             lines.append("")
-            for r in run.step_results:
+            for i, r in enumerate(run.step_results):
                 icon = (
                     "✅"
                     if r.status == "success"
                     else "❌" if r.status == "failed" else "⏭"
                 )
                 duration = f" ({r.duration_ms}ms)" if r.duration_ms else ""
-                lines.append(f"{icon} **{r.step_id}**{duration}")
-                if r.output and skill.output_format != "summary":
-                    # Truncate long outputs
-                    out = r.output[:500] + "..." if len(r.output) > 500 else r.output
-                    lines.append(f"```\n{out}\n```")
-                elif r.error:
-                    lines.append(f"```\n{r.error}\n```")
+                is_last = i == len(run.step_results) - 1
+
+                if is_last and r.output and r.status == "success":
+                    # Final step — include full output as the deliverable
+                    lines.append(f"{icon} **{r.step_id}**{duration}")
+                    lines.append("")
+                    lines.append(r.output)
+                else:
+                    lines.append(f"{icon} **{r.step_id}**{duration}")
+                    if r.error:
+                        lines.append(f"```\n{r.error}\n```")
 
         return "\n".join(lines)

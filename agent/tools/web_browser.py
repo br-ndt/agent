@@ -1,16 +1,21 @@
 """Web browser tool — full rendering via Playwright.
 
-This tool can render JavaScript-heavy sites, take screenshots (future), 
-and extract clean text for LLMs.
+Renders JavaScript-heavy sites, takes screenshots, and extracts clean text.
 """
+
+from pathlib import Path
 
 from playwright.async_api import async_playwright
 import structlog
 
 log = structlog.get_logger()
 
+
 class WebBrowserTool:
-    async def fetch(self, url: str) -> dict:
+    def __init__(self, screenshot_dir: Path | None = None):
+        self.screenshot_dir = screenshot_dir
+
+    async def fetch(self, url: str, screenshot: bool = True) -> dict:
         """Render a URL using Playwright and return simplified text content."""
         if not url.startswith("http"):
             url = f"https://{url}"
@@ -39,8 +44,18 @@ class WebBrowserTool:
                 await page.evaluate("window.scrollTo(0, 0)")
                 await page.wait_for_timeout(1000)
                 
-                # Get page title and all text
+                # Get page title
                 title = await page.title()
+
+                # Take screenshot before we strip elements for text extraction
+                screenshot_path = None
+                if screenshot and self.screenshot_dir:
+                    self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+                    # Sanitize URL into a filename
+                    safe_name = url.split("//")[-1].replace("/", "_").replace("?", "_")[:80]
+                    screenshot_path = self.screenshot_dir / f"{safe_name}.png"
+                    await page.screenshot(path=str(screenshot_path), full_page=True)
+                    log.info("web_browser_screenshot", path=str(screenshot_path))
                 
                 # Extract clean text via evaluating in-page script
                 # We're going back to a simpler but more reliable innerText approach
@@ -94,12 +109,15 @@ class WebBrowserTool:
                 log.info("web_browser_done", url=url, title=title, content_len=len(text))
                 await browser.close()
 
-                return {
+                result = {
                     "url": url,
                     "title": title,
                     "content": text[:15000],  # Truncate for context window
-                    "truncated": len(text) > 15000
+                    "truncated": len(text) > 15000,
                 }
+                if screenshot_path and screenshot_path.exists():
+                    result["screenshot"] = str(screenshot_path)
+                return result
         except Exception as e:
             log.error("web_browser_failed", url=url, error=str(e))
             return {"error": str(e)}

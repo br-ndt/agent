@@ -370,6 +370,7 @@ class Orchestrator:
                         structured_skill_ran = True
 
                         async def _run_skill_bg(sk=skill, task=op["task"]):
+                            log.info("background_skill_starting", skill=sk.name, session=session_id)
                             try:
                                 run = await self.skill_executor.execute(
                                     skill=sk,
@@ -379,11 +380,12 @@ class Orchestrator:
                                     triggered_by=session_id,
                                 )
                                 result_text = self.skill_executor.format_run_result(sk, run)
+                                log.info("background_skill_done", skill=sk.name, result_len=len(result_text))
                                 await reply_fn(result_text)
                                 await session.add_message("assistant", result_text)
                             except Exception as e:
                                 err = f"Skill '{sk.name}' failed: {e}"
-                                log.error("background_skill_failed", error=str(e))
+                                log.error("background_skill_failed", error=str(e), exc_info=True)
                                 await reply_fn(err)
                             finally:
                                 self._skill_tasks.pop(session_id, None)

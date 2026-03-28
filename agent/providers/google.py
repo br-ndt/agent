@@ -1,6 +1,7 @@
-"""Google (Gemini) provider."""
+"""Google (Gemini) provider — supports text and image inputs."""
 
 import structlog
+from pathlib import Path
 
 from google import genai
 from google.genai import types
@@ -21,16 +22,32 @@ class GoogleProvider(BaseProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         tools: list[dict] | None = None,
-        cwd: str | None = None
+        cwd: str | None = None,
+        **kwargs,
     ) -> LLMResponse:
         # Convert from OpenAI-style messages to Gemini format
+        # Messages can include image paths via {"role": "user", "content": ..., "images": [...]}
         contents = []
         for msg in messages:
             role = "model" if msg["role"] == "assistant" else "user"
-            contents.append(types.Content(
-                role=role,
-                parts=[types.Part(text=msg["content"])],
-            ))
+            parts = [types.Part(text=msg["content"])]
+
+            # Attach images if present
+            for img in msg.get("images", []):
+                img_path = Path(img) if isinstance(img, str) else None
+                if img_path and img_path.exists():
+                    mime = "image/png" if img_path.suffix == ".png" else "image/jpeg"
+                    parts.append(types.Part.from_bytes(
+                        data=img_path.read_bytes(),
+                        mime_type=mime,
+                    ))
+                elif isinstance(img, bytes):
+                    parts.append(types.Part.from_bytes(
+                        data=img,
+                        mime_type="image/png",
+                    ))
+
+            contents.append(types.Content(role=role, parts=parts))
 
         config = types.GenerateContentConfig(
             max_output_tokens=max_tokens,
