@@ -53,11 +53,13 @@ class BashTool:
         timeout: int = DEFAULT_TIMEOUT,
         allow_network: bool = False,
         allow_packages: bool = False,
+        allow_git: bool = False,
     ):
         self.workspace = Path(workspace)
         self.timeout = timeout
         self.allow_network = allow_network
         self.allow_packages = allow_packages
+        self.allow_git = allow_git
 
         # Create workspace if needed
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -82,9 +84,10 @@ class BashTool:
                 if cmd_lower.startswith(cmd) or f" {cmd}" in cmd_lower:
                     return f"Package command '{cmd}' not allowed (enable allow_packages)"
 
-        # Block path traversal outside workspace
+        # Block path traversal outside workspace (git submodules may need ..)
         if ".." in command and ("/" in command or "\\" in command):
-            return "Path traversal with '..' is not allowed"
+            if not self.allow_git:
+                return "Path traversal with '..' is not allowed"
 
         return None
 
@@ -113,6 +116,18 @@ class BashTool:
                 "TERM": "dumb",
                 "LANG": "C.UTF-8",
             }
+
+            if self.allow_git:
+                home = os.path.expanduser("~")
+                env.update({
+                    "HOME": home,  # git/gh need real HOME for SSH + config
+                    "GIT_AUTHOR_NAME": "agent-entro",
+                    "GIT_AUTHOR_EMAIL": "agent-entro@users.noreply.github.com",
+                    "GIT_COMMITTER_NAME": "agent-entro",
+                    "GIT_COMMITTER_EMAIL": "agent-entro@users.noreply.github.com",
+                    "GIT_SSH_COMMAND": "ssh -i ~/.ssh/id_clawdnet_bot -o StrictHostKeyChecking=no",
+                    "GH_CONFIG_DIR": os.path.join(home, ".config", "gh"),
+                })
 
             proc = await asyncio.create_subprocess_shell(
                 command,

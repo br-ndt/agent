@@ -15,28 +15,13 @@ def build_providers(cfg: Config) -> dict[str, BaseProvider]:
     """Build a dict of provider_name -> provider_instance from config."""
     providers: dict[str, BaseProvider] = {}
 
-    # Claude CLI provider — uses your Pro/Max subscription (no API key needed)
+    # Claude CLI provider — uses your Pro/Max subscription (no API key needed).
+    # Native tools are enabled; SubagentRunner maps its tool config to
+    # Claude Code's native tool names via --allowedTools per call.
     if shutil.which("claude"):
         from .claude_cli import ClaudeCLIProvider
 
-        # Text-only (orchestrator) — no sandbox needed, can't write
-        providers["claude_cli"] = ClaudeCLIProvider(
-            disallowed_tools=["Bash", "Read", "Write", "Edit", "ListDir",
-                              "Grep", "Glob", "WebSearch", "WebFetch"],
-        )
-
-        # Tool-enabled claudes — sandboxed, can't escape workspace
-        providers["claude_cli_tools"] = ClaudeCLIProvider(
-            docker_image="agent-coder",
-            disallowed_tools=["WebSearch", "WebFetch"],  # Allow coding tools, disallow internet access
-            timeout=300,
-        )
-
-        providers["claude_cli_research"] = ClaudeCLIProvider(
-            docker_image="agent-coder",
-            allowed_tools=["WebSearch", "WebFetch", "Read"],
-            timeout=120,
-        )
+        providers["claude_cli"] = ClaudeCLIProvider()
     else:
         log.debug("claude_cli_not_available",
                   hint="Install: npm install -g @anthropic-ai/claude-code && claude login")
@@ -80,19 +65,20 @@ def build_resilient_providers(cfg: Config) -> dict[str, BaseProvider]:
         fb = fallback_provider if fallback_provider is not provider else None
         fb_model = fallback_model if fb else ""
 
-        # Docker-sandboxed providers must not fall back to unsandboxed ones
-        if hasattr(provider, 'docker_image') and provider.docker_image:
-            fb = None
-            fb_model = ""
-
-        # Claude CLI gets longer timeout (subprocess overhead)
-        timeout = 180.0 if name == "claude_cli" else 120.0
+        # Claude CLI: long timeout (Opus can take 5+ min), no retries —
+        # SubagentRunner handles fallback at the subagent level.
+        if name == "claude_cli":
+            timeout = 600.0
+            retries = 0
+        else:
+            timeout = 120.0
+            retries = 2
 
         resilient[name] = ResilientProvider(
             primary=provider,
             fallback=fb,
             fallback_model=fb_model,
-            max_retries=2,
+            max_retries=retries,
             timeout=timeout,
         )
 

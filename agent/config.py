@@ -12,15 +12,48 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+# Maps model name prefixes to provider names.
+# Order matters: more specific prefixes first.
+_MODEL_PREFIXES: list[tuple[str, str]] = [
+    ("gemini", "google"),
+    ("gpt-", "openai"),
+    ("o1-", "openai"),
+    ("o3-", "openai"),
+    ("o4-", "openai"),
+    ("claude-", "claude_cli"),
+    ("opus", "claude_cli"),
+    ("sonnet", "claude_cli"),
+    ("haiku", "claude_cli"),
+]
+
+
+def infer_provider(model: str, tools: list[str] | None = None) -> str:
+    """Infer the provider name from a model name.
+
+    All tool use is handled by SubagentRunner's custom tool loop,
+    so the provider just needs to do text completion.
+    """
+    m = model.lower().strip()
+    for prefix, provider in _MODEL_PREFIXES:
+        if m.startswith(prefix) or m == prefix:
+            return provider
+    return "anthropic"
+
+
 @dataclass
 class SubagentConfig:
     name: str
-    provider: str
     model: str
     personality: str
+    provider: str = ""        # optional: inferred from model + tools if empty
+    fallback_model: str = ""  # optional fallback; provider is also inferred
     tools: list[str] = field(default_factory=list)
     max_tokens: int = 4096
     temperature: float = 0.7
+
+    @property
+    def resolved_provider(self) -> str:
+        return self.provider or infer_provider(self.model, self.tools)
 
 
 @dataclass
@@ -39,12 +72,12 @@ class Config:
     admin_ids: set[str] = field(default_factory=set)
     trusted_ids: set[str] = field(default_factory=set)
 
-    # Tier-based provider+model overrides: tier -> {provider, model}
+    # Tier-based routing: tier -> {model, provider (optional)}
     tier_routing: dict[str, dict[str, str]] = field(default_factory=dict)
 
     # Orchestrator
-    orchestrator_provider: str = "claude_cli"
-    orchestrator_model: str = "sonnet"
+    orchestrator_model: str = "gemini-2.5-flash"
+    orchestrator_fallback_model: str = ""
     orchestrator_system_prompt: str = ""
     orchestrator_max_tokens: int = 4096
 
@@ -54,6 +87,10 @@ class Config:
     # Services
     status_port: int = 8765
     log_level: str = "INFO"
+
+    @property
+    def orchestrator_provider(self) -> str:
+        return infer_provider(self.orchestrator_model)
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -90,19 +127,21 @@ def _apply_yaml(cfg: Config, raw: dict):
     """Merge YAML config into the Config object."""
     # Orchestrator
     orch = raw.get("orchestrator", {})
-    cfg.orchestrator_provider = orch.get("provider", cfg.orchestrator_provider)
     cfg.orchestrator_model = orch.get("model", cfg.orchestrator_model)
+    cfg.orchestrator_fallback_model = orch.get("fallback", cfg.orchestrator_fallback_model)
     cfg.orchestrator_system_prompt = orch.get("system_prompt", "")
     cfg.orchestrator_max_tokens = orch.get("max_tokens", cfg.orchestrator_max_tokens)
 
     # Subagents
     for name, sa_raw in raw.get("subagents", {}).items():
+        tools = sa_raw.get("tools", [])
         cfg.subagents[name] = SubagentConfig(
             name=name,
-            provider=sa_raw.get("provider", "anthropic"),
             model=sa_raw.get("model", "claude-sonnet-4-6"),
+            provider=sa_raw.get("provider", ""),  # explicit override, usually omitted
+            fallback_model=sa_raw.get("fallback", ""),
             personality=sa_raw.get("personality", ""),
-            tools=sa_raw.get("tools", []),
+            tools=tools,
             max_tokens=sa_raw.get("max_tokens", 4096),
             temperature=sa_raw.get("temperature", 0.7),
         )
@@ -114,10 +153,10 @@ def _apply_yaml(cfg: Config, raw: dict):
         cfg.trusted_ids.add(tid)
     for tier, routing in raw.get("access", {}).get("tier_routing", {}).items():
         if tier and routing:
-            cfg.tier_routing[tier] = {
-                "provider": routing.get("provider", cfg.orchestrator_provider),
-                "model": routing.get("model", cfg.orchestrator_model),
-            }
+            model = routing.get("model", cfg.orchestrator_model)
+            # provider can be explicitly set; otherwise inferred from model name
+            provider = routing.get("provider") or infer_provider(model)
+            cfg.tier_routing[tier] = {"provider": provider, "model": model}
     cfg.other_bots = raw.get("access", {}).get("other_bots", {}) or {}
 
 
@@ -134,7 +173,6 @@ def _apply_defaults(cfg: Config):
 
     cfg.subagents["coder"] = SubagentConfig(
         name="coder",
-        provider="claude_cli",
         model="sonnet",
         personality=(
             "You are a senior software engineer. Write clean, well-documented code. "
@@ -146,7 +184,6 @@ def _apply_defaults(cfg: Config):
 
     cfg.subagents["reviewer"] = SubagentConfig(
         name="reviewer",
-        provider="claude_cli",
         model="sonnet",
         personality=(
             "You are a meticulous code reviewer. Focus on bugs, security issues, "

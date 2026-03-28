@@ -59,7 +59,15 @@ class Router:
             or upper.startswith("SKILL ")
             or upper == "RELOAD SKILLS"
         ):
-            await self._handle_admin_command(msg)
+            clean_msg = IncomingMessage(
+                platform=msg.platform,
+                sender_id=msg.sender_id,
+                sender_name=msg.sender_name,
+                text=raw_text,
+                chat_id=msg.chat_id,
+                attachments=msg.attachments,
+            )
+            await self._handle_admin_command(clean_msg)
             return
 
         # Get the adapter for replies
@@ -202,16 +210,38 @@ class Router:
         self, msg: IncomingMessage, adapter: BaseAdapter
     ):
         parts = msg.text.strip().split(maxsplit=2)
-        if len(parts) < 3:
+        if len(parts) < 2:
             await adapter.send(
                 msg.chat_id,
-                "Usage: SKILL INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN <name>",
+                "Usage: SKILL STATUS | SKILL INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN <name>",
             )
             return
 
         subcmd = parts[1].upper()
-        name = parts[2].strip()
         registry = self.orchestrator.skill_registry
+
+        # STATUS doesn't require a skill name
+        if subcmd == "STATUS":
+            executor = self.orchestrator.skill_executor
+            if not executor.active_runs:
+                await adapter.send(msg.chat_id, "No skills currently running.")
+                return
+            lines = []
+            for sid, run in executor.active_runs.items():
+                status = executor.get_status(sid)
+                if status:
+                    lines.append(status)
+            await adapter.send(msg.chat_id, "\n\n".join(lines) or "No active runs.")
+            return
+
+        if len(parts) < 3:
+            await adapter.send(
+                msg.chat_id,
+                "Usage: SKILL STATUS | SKILL INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN <name>",
+            )
+            return
+
+        name = parts[2].strip()
 
         async def reply_fn(text: str):
             await adapter.send(msg.chat_id, text)
@@ -277,23 +307,22 @@ class Router:
 
         elif subcmd == "RUN":
             skill = registry.get(name)
-            if skill and skill.subagent in self.orchestrator.subagents:
+            if skill:
                 run = await self.orchestrator.skill_executor.execute(
                     skill=skill,
                     task_context="Manual trigger via SKILL RUN command",
-                    subagent_runner=self.orchestrator.subagents[skill.subagent],
+                    subagent_runners=self.orchestrator.subagents,
                     session_id="admin-manual",
-                    progress_fn=reply_fn,
                 )
                 result = self.orchestrator.skill_executor.format_run_result(skill, run)
                 await adapter.send(msg.chat_id, result)
             else:
                 await adapter.send(
-                    msg.chat_id, f"Skill '{name}' not found or subagent unavailable."
+                    msg.chat_id, f"Skill '{name}' not found."
                 )
 
         else:
             await adapter.send(
                 msg.chat_id,
-                f"Unknown: SKILL {subcmd}. Try INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN",
+                f"Unknown: SKILL {subcmd}. Try STATUS|INFO|APPROVE|REJECT|DISABLE|ENABLE|HISTORY|RUN",
             )

@@ -43,48 +43,39 @@ MODEL_ALIASES = {
 class ClaudeCLIProvider(BaseProvider):
     """Calls Claude via the CLI subprocess using your subscription."""
 
-    def __init__(self, timeout: int = 300, allowed_tools: list[str] | None = None, disallowed_tools: list[str] | None = None, cwd: str | None = None, docker_image=None):
+    has_native_tools = True  # SubagentRunner checks this to choose execution path
+
+    def __init__(self, timeout: int = 600, allowed_tools: list[str] | None = None, disallowed_tools: list[str] | None = None, cwd: str | None = None):
         self.timeout = timeout
         self.allowed_tools = allowed_tools or []
         self.disallowed_tools = disallowed_tools or []
         self.cwd = cwd
-        self.docker_image = docker_image
 
     async def complete(self, messages, system="", model="sonnet",
                        max_tokens=4096, temperature=0.7, tools=None,
                        cwd=None, **kwargs) -> LLMResponse:
         cli_model = MODEL_ALIASES.get(model, model)
 
-        # Build base command
+        # Build base command — stream-json gives us live progress events
         base_cmd = [
             "claude", "-p",
-            "--output-format", "json",
+            "--verbose",
+            "--output-format", "stream-json",
+            "--dangerously-skip-permissions",
             "--model", cli_model,
         ]
 
-        if self.allowed_tools:
-            base_cmd.extend(["--allowedTools", " ".join(self.allowed_tools)])
-        if self.disallowed_tools:
-            base_cmd.extend(["--disallowedTools", " ".join(self.disallowed_tools)])
+        # Per-call overrides take priority over constructor defaults
+        allowed = kwargs.get("allowed_tools", self.allowed_tools)
+        disallowed = kwargs.get("disallowed_tools", self.disallowed_tools)
+        if allowed:
+            base_cmd.extend(["--allowedTools", " ".join(allowed)])
+        if disallowed:
+            base_cmd.extend(["--disallowedTools", " ".join(disallowed)])
         if system:
             base_cmd.extend(["--system-prompt", system])
 
-        # Wrap in Docker if configured
-        if self.docker_image:
-            workspace = cwd or "/tmp"
-            cmd = [
-                "docker", "run", "--rm", "-i",
-                "-v", f"{workspace}:/workspace",
-                "-v", "/home/ubuntu/agent/docker/.claude.json:/home/coder/.claude.json:ro",
-                "-v", "/home/ubuntu/agent/docker/claude:/home/coder/.claude:ro",
-                "-w", "/workspace",
-                "--user", "coder",
-                "--memory=512m",
-                "--cpus=1",
-                self.docker_image,
-            ] + base_cmd
-        else:
-            cmd = base_cmd
+        cmd = base_cmd
 
         prompt = _flatten_messages(messages)
 
@@ -94,6 +85,8 @@ class ClaudeCLIProvider(BaseProvider):
             import os
             env = {k: v for k, v in os.environ.items()
                    if k != "ANTHROPIC_API_KEY"}
+            # Apply per-call env overrides (e.g., git identity)
+            env.update(kwargs.get("env", {}))
 
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -104,48 +97,96 @@ class ClaudeCLIProvider(BaseProvider):
                 cwd=cwd or self.cwd,
             )
 
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(input=prompt.encode("utf-8")),
-                timeout=self.timeout,
-            )
+            # Send prompt to stdin, then close it
+            proc.stdin.write(prompt.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
 
-            stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
-            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+            # Parse stream-json: one JSON object per line.
+            # Event types: "system", "assistant", "result"
+            # We log tool use and text chunks as they arrive,
+            # and collect the final "result" event.
+            result = None
+            import time as _time
+            deadline = _time.monotonic() + self.timeout
 
-            if proc.returncode != 0:
-                log.error(
-                    "claude_cli_error",
-                    returncode=proc.returncode,
-                    stderr=stderr[:500],
-                    stdout=stdout[:500],
-                )
-                raise RuntimeError(
-                    f"claude CLI exited with code {proc.returncode}: "
-                    f"{stderr[:200] or stdout[:200]}"
-                )
+            while True:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    raise asyncio.TimeoutError()
 
-            result = json.loads(stdout)
+                try:
+                    raw_line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    raise
 
-            # Response format:
-            # {
-            #   "type": "result",
-            #   "result": "Hello!",           <-- the actual text
-            #   "is_error": false,
-            #   "total_cost_usd": 0.008,
-            #   "usage": { "input_tokens": ..., "output_tokens": ... },
-            #   "modelUsage": { "claude-sonnet-4-6": { ... } },
-            #   ...
-            # }
+                if not raw_line:
+                    break  # EOF
+
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    log.debug("claude_cli_unparseable_line", line=line[:200])
+                    continue
+
+                etype = event.get("type", "")
+
+                if etype == "result":
+                    result = event
+                elif etype == "assistant":
+                    # Tool use or text — log for visibility
+                    tool = event.get("tool")
+                    if tool:
+                        log.info("claude_cli_tool_use",
+                                 model=cli_model, tool=tool,
+                                 input_preview=str(event.get("input", ""))[:150])
+                    else:
+                        text = event.get("content", "")
+                        if text:
+                            log.info("claude_cli_text",
+                                     model=cli_model, preview=text[:150])
+                elif etype == "system":
+                    log.info("claude_cli_system", model=cli_model,
+                             data=json.dumps(event, default=str)[:300])
+                else:
+                    log.info("claude_cli_other", model=cli_model,
+                             data=json.dumps(event, default=str)[:300])
+
+            # Wait for process to finish
+            await proc.wait()
+
+            if result is None:
+                stderr_bytes = await proc.stderr.read()
+                stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"claude CLI exited with code {proc.returncode}: {stderr[:200]}"
+                    )
+                raise RuntimeError("claude CLI produced no result event")
+
             content = result.get("result", "")
 
             if result.get("is_error"):
                 raise RuntimeError(f"Claude CLI returned error: {content}")
 
-            # Extract token usage from modelUsage (more accurate)
+            # Extract token usage from modelUsage
             usage = {}
             model_usage = result.get("modelUsage", {})
             if model_usage:
-                # modelUsage is keyed by the full model name
                 first_model = next(iter(model_usage.values()), {})
                 usage = {
                     "input_tokens": first_model.get("inputTokens", 0),

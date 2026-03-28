@@ -16,18 +16,24 @@ MAX_FILES_LIST = 200
 
 
 class FileOpsTool:
-    """File operations scoped to a workspace directory."""
+    """File operations scoped to a workspace directory.
 
-    def __init__(self, workspace: Path):
+    Writes are restricted to `workspace`. Reads are allowed within
+    `read_root` (defaults to workspace), enabling cross-workspace reads
+    when a broader root like the parent workspaces/ dir is passed.
+    """
+
+    def __init__(self, workspace: Path, read_root: Path | None = None):
         self.workspace = Path(workspace).resolve()
+        self.read_root = Path(read_root).resolve() if read_root else self.workspace
         self.workspace.mkdir(parents=True, exist_ok=True)
 
-    def _resolve_safe(self, path: str) -> Path | None:
-        """Resolve a path within the workspace. Returns None if it escapes."""
+    def _resolve_safe(self, path: str, for_write: bool = False) -> Path | None:
+        """Resolve a path. Writes must be inside workspace; reads inside read_root."""
+        boundary = self.workspace if for_write else self.read_root
         try:
             resolved = (self.workspace / path).resolve()
-            # Must be inside workspace
-            if not str(resolved).startswith(str(self.workspace)):
+            if not str(resolved).startswith(str(boundary)):
                 return None
             return resolved
         except (ValueError, OSError):
@@ -58,9 +64,9 @@ class FileOpsTool:
 
     async def write(self, path: str, content: str) -> dict:
         """Write content to a file (creates parent dirs as needed)."""
-        resolved = self._resolve_safe(path)
+        resolved = self._resolve_safe(path, for_write=True)
         if not resolved:
-            return {"error": f"Path '{path}' is outside workspace"}
+            return {"error": f"Path '{path}' is outside workspace (writes are restricted)"}
 
         if len(content) > MAX_FILE_SIZE:
             return {"error": f"Content too large: {len(content)} bytes (max {MAX_FILE_SIZE})"}
@@ -75,9 +81,9 @@ class FileOpsTool:
 
     async def edit(self, path: str, old: str, new: str) -> dict:
         """Replace a string in a file (first occurrence only)."""
-        resolved = self._resolve_safe(path)
+        resolved = self._resolve_safe(path, for_write=True)
         if not resolved:
-            return {"error": f"Path '{path}' is outside workspace"}
+            return {"error": f"Path '{path}' is outside workspace (writes are restricted)"}
 
         if not resolved.exists():
             return {"error": f"File not found: {path}"}
@@ -126,9 +132,9 @@ class FileOpsTool:
 
     async def delete(self, path: str) -> dict:
         """Delete a file (not directories)."""
-        resolved = self._resolve_safe(path)
+        resolved = self._resolve_safe(path, for_write=True)
         if not resolved:
-            return {"error": f"Path '{path}' is outside workspace"}
+            return {"error": f"Path '{path}' is outside workspace (writes are restricted)"}
 
         if not resolved.exists():
             return {"error": f"File not found: {path}"}

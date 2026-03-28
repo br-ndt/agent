@@ -149,11 +149,10 @@ class DiscordAdapter(BaseAdapter):
 
             system_context = ""
             if message.guild and hasattr(message.channel, "members"):
-                channel_members = [
-                    f"{m.display_name} (<@{m.id}>)"
-                    for m in message.channel.members
-                    if not m.bot
-                ]
+                channel_members = []
+                for m in message.channel.members:
+                    member_type = "[BOT]" if m.bot else "[USER]"
+                    channel_members.append(f"{member_type} {m.display_name} (<@{m.id}>)")
 
                 if len(channel_members) > 50:
                     channel_members = channel_members[:50]

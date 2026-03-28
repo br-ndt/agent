@@ -10,19 +10,59 @@ Storage: YAML manifests on disk (git-tracked), metadata + run history in SQLite.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any
 
 import asyncio
 import json
 import sqlite3
 import time
 import yaml
+import re
 import structlog
 
 log = structlog.get_logger()
 
 DEFAULT_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "state" / "skills.db"
+
+
+def sanitize_skill_name(name: str) -> str:
+    """
+    Sanitize a skill name for use as a directory/file name.
+
+    - Takes only the first line (in case newlines are present)
+    - Removes/replaces invalid characters
+    - Truncates to reasonable length
+    - Converts to lowercase with hyphens
+    """
+    # Take only first line (before any newline)
+    name = name.split("\n")[0].strip()
+
+    # Remove any system context markers that might have leaked in
+    if "[system" in name.lower():
+        name = name.split("[System")[0].strip()
+    if "[bot]" in name.lower():
+        name = name.split("[")[0].strip()
+
+    # Truncate to max 50 chars for the base name
+    name = name[:50].strip()
+
+    # Replace spaces and invalid characters
+    name = name.lower()
+    name = name.replace(" ", "-")
+
+    # Remove any remaining invalid filesystem characters
+
+    name = re.sub(r"[^a-z0-9\-_]", "", name)
+
+    # Ensure it doesn't start/end with hyphen
+    name = name.strip("-")
+
+    # Fallback if empty
+    if not name:
+        name = "unnamed-skill"
+
+    return name
 
 
 # ── Data Models ─────────────────────────────────────────────────────
@@ -41,6 +81,7 @@ class SkillStep:
     condition: str = ""  # for conditional steps
     branches: dict[str, list[str]] = field(default_factory=dict)
     sub_steps: list["SkillStep"] = field(default_factory=list)  # for parallel
+    subagent: str = ""  # per-step subagent override (falls back to skill.subagent)
 
 
 @dataclass
@@ -66,6 +107,8 @@ class SkillRun:
     step_results: list[StepResult] = field(default_factory=list)
     error: str = ""
     triggered_by: str = ""
+    current_step: str = ""  # id of the step currently executing
+    total_steps: int = 0
 
 
 @dataclass
@@ -139,7 +182,9 @@ class Skill:
 
     def catalog_entry(self) -> str:
         """Compact representation for injection into orchestrator system prompt."""
-        triggers_str = ", ".join(f'"{t}"' for t in self.triggers) if self.triggers else "none"
+        triggers_str = (
+            ", ".join(f'"{t}"' for t in self.triggers) if self.triggers else "none"
+        )
         if self.has_steps:
             step_flow = " → ".join(s.id for s in self.steps)
             return (
@@ -160,6 +205,8 @@ def _step_to_dict(step: SkillStep) -> dict:
     d: dict[str, Any] = {"id": step.id, "type": step.type}
     if step.description:
         d["description"] = step.description
+    if step.subagent:
+        d["subagent"] = step.subagent
     if step.command:
         d["command"] = step.command
     if step.prompt:
@@ -187,6 +234,7 @@ def _dict_to_step(d: dict) -> SkillStep:
         condition=d.get("condition", ""),
         branches=d.get("branches", {}),
         sub_steps=[_dict_to_step(s) for s in d.get("sub_steps", [])],
+        subagent=d.get("subagent", ""),
     )
 
 
@@ -220,8 +268,12 @@ def load_skills(skills_dir: Path | None = None) -> list[Skill]:
             skill = _load_skill_file(skill_file, skill_folder)
             if skill:
                 skills.append(skill)
-                log.info("skill_loaded", name=skill.name, subagent=skill.subagent,
-                         has_steps=skill.has_steps)
+                log.info(
+                    "skill_loaded",
+                    name=skill.name,
+                    subagent=skill.subagent,
+                    has_steps=skill.has_steps,
+                )
         except Exception as e:
             log.error("skill_load_failed", path=str(skill_file), error=str(e))
 
@@ -294,7 +346,7 @@ def _load_skill_file(skill_file: Path, skill_folder: Path) -> Skill | None:
 def save_skill(skill: Skill, skills_dir: Path | None = None) -> Path:
     """Save a skill to the directory."""
     directory = skills_dir or DEFAULT_SKILLS_DIR
-    skill_folder = directory / skill.name.lower().replace(" ", "-")
+    skill_folder = directory / sanitize_skill_name(skill.name)
     skill_folder.mkdir(parents=True, exist_ok=True)
 
     skill_file = skill_folder / "SKILL.md"
@@ -307,7 +359,7 @@ def save_skill(skill: Skill, skills_dir: Path | None = None) -> Path:
 def save_proposed_skill(skill: Skill, skills_dir: Path | None = None) -> Path:
     """Save a skill to the _proposed/ staging directory."""
     directory = (skills_dir or DEFAULT_SKILLS_DIR) / "_proposed"
-    skill_folder = directory / skill.name.lower().replace(" ", "-")
+    skill_folder = directory / sanitize_skill_name(skill.name)
     skill_folder.mkdir(parents=True, exist_ok=True)
 
     skill_file = skill_folder / "SKILL.md"
@@ -320,8 +372,9 @@ def save_proposed_skill(skill: Skill, skills_dir: Path | None = None) -> Path:
 def approve_skill(name: str, skills_dir: Path | None = None) -> bool:
     """Move a proposed skill from _proposed/ to the active skills directory."""
     directory = skills_dir or DEFAULT_SKILLS_DIR
-    proposed_dir = directory / "_proposed" / name.lower().replace(" ", "-")
-    active_dir = directory / name.lower().replace(" ", "-")
+    safe_name = sanitize_skill_name(name)
+    proposed_dir = directory / "_proposed" / safe_name
+    active_dir = directory / safe_name
 
     if not proposed_dir.exists():
         log.warning("proposed_skill_not_found", name=name)
@@ -329,6 +382,7 @@ def approve_skill(name: str, skills_dir: Path | None = None) -> bool:
 
     # Move the folder
     import shutil
+
     if active_dir.exists():
         shutil.rmtree(active_dir)
     shutil.move(str(proposed_dir), str(active_dir))
@@ -339,11 +393,14 @@ def approve_skill(name: str, skills_dir: Path | None = None) -> bool:
 
 def reject_skill(name: str, skills_dir: Path | None = None) -> bool:
     """Delete a proposed skill."""
-    directory = (skills_dir or DEFAULT_SKILLS_DIR) / "_proposed" / name.lower().replace(" ", "-")
+    directory = (
+        (skills_dir or DEFAULT_SKILLS_DIR) / "_proposed" / sanitize_skill_name(name)
+    )
     if not directory.exists():
         return False
 
     import shutil
+
     shutil.rmtree(directory)
     log.info("skill_rejected", name=name)
     return True
@@ -366,7 +423,8 @@ class SkillRegistry:
         """Create the SQLite tables if they don't exist."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(str(self.db_path)) as conn:
-            conn.executescript("""
+            conn.executescript(
+                """
                 CREATE TABLE IF NOT EXISTS skill_meta (
                     name TEXT PRIMARY KEY,
                     last_used TIMESTAMP,
@@ -389,7 +447,8 @@ class SkillRegistry:
                 CREATE VIRTUAL TABLE IF NOT EXISTS skill_search USING fts5(
                     name, description, tags, triggers
                 );
-            """)
+            """
+            )
 
     def reload(self) -> None:
         """Re-scan skills directory and rebuild the in-memory index."""
@@ -512,11 +571,17 @@ class SkillRegistry:
                     run.started_at.isoformat(),
                     run.completed_at.isoformat() if run.completed_at else None,
                     run.status,
-                    json.dumps([
-                        {"step_id": r.step_id, "status": r.status,
-                         "output": r.output[:500], "duration_ms": r.duration_ms}
-                        for r in run.step_results
-                    ]),
+                    json.dumps(
+                        [
+                            {
+                                "step_id": r.step_id,
+                                "status": r.status,
+                                "output": r.output[:500],
+                                "duration_ms": r.duration_ms,
+                            }
+                            for r in run.step_results
+                        ]
+                    ),
                     run.error,
                     run.triggered_by,
                 ),
@@ -562,47 +627,95 @@ class SkillExecutor:
 
     def __init__(self, registry: SkillRegistry):
         self.registry = registry
+        self.active_runs: dict[str, SkillRun] = {}  # session_id -> current run
+
+    def get_status(self, session_id: str) -> str | None:
+        """Get a human-readable status string for an active run, or None."""
+        run = self.active_runs.get(session_id)
+        if not run:
+            return None
+        completed = len(run.step_results)
+        elapsed = (datetime.now(timezone.utc) - run.started_at).total_seconds()
+        lines = [f"**{run.skill_name}** — {run.status} ({elapsed:.0f}s elapsed)"]
+        for r in run.step_results:
+            icon = "✅" if r.status == "success" else "❌" if r.status == "failed" else "⏭"
+            lines.append(f"  {icon} {r.step_id} ({r.duration_ms}ms)")
+        if run.current_step:
+            lines.append(f"  ⏳ {run.current_step} (running...)")
+        remaining = run.total_steps - completed - (1 if run.current_step else 0)
+        if remaining > 0:
+            lines.append(f"  ⬚ {remaining} step(s) remaining")
+        return "\n".join(lines)
 
     async def execute(
         self,
         skill: Skill,
         task_context: str,
-        subagent_runner: "SubagentRunner",
+        subagent_runners: "dict[str, SubagentRunner]",
         session_id: str = "",
         triggered_by: str = "",
-        progress_fn: Callable[[str], Awaitable[None]] | None = None,
     ) -> SkillRun:
         """Execute a skill and return the run record.
 
-        Args:
-            skill: The skill to execute.
-            task_context: Additional context from the user's message.
-            subagent_runner: The SubagentRunner for this skill's subagent.
-            session_id: Current session ID.
-            triggered_by: User ID who triggered the skill.
-            progress_fn: Async callback to send progress updates (e.g., to Discord).
+        Progress is tracked on the SkillRun object (queryable via get_status)
+        rather than pushed to the chat.
         """
         run = SkillRun(
             skill_name=skill.name,
             session_id=session_id,
             triggered_by=triggered_by,
+            total_steps=len(skill.steps),
         )
+        self.active_runs[session_id] = run
 
+        try:
+            return await self._execute_inner(
+                skill, task_context, subagent_runners, run
+            )
+        finally:
+            self.active_runs.pop(session_id, None)
+
+    async def _execute_inner(
+        self,
+        skill: Skill,
+        task_context: str,
+        subagent_runners: "dict[str, SubagentRunner]",
+        run: SkillRun,
+    ) -> SkillRun:
         if not skill.has_steps:
-            # No structured steps — fall back to original behavior
-            # (send skill content + task to the subagent as a single prompt)
+            default_runner = subagent_runners.get(skill.subagent)
+            if not default_runner:
+                run.status = "failed"
+                run.error = f"Subagent '{skill.subagent}' not found"
+                run.completed_at = datetime.now(timezone.utc)
+                self.registry.record_run(run)
+                return run
             return await self._execute_unstructured(
-                skill, task_context, subagent_runner, run, progress_fn
+                skill, task_context, default_runner, run
             )
 
         total = len(skill.steps)
         prior_outputs: list[str] = []
 
         for i, step in enumerate(skill.steps, 1):
-            step_label = f"Step {i}/{total}: {step.description or step.id}"
+            subagent_name = step.subagent or skill.subagent
+            subagent_runner = subagent_runners.get(subagent_name)
 
-            if progress_fn:
-                await progress_fn(f"⏳ {step_label}...")
+            if not subagent_runner:
+                result = StepResult(
+                    step_id=step.id,
+                    status="failed",
+                    error=f"Subagent '{subagent_name}' not found",
+                )
+                run.step_results.append(result)
+                run.status = "failed"
+                run.error = result.error
+                break
+
+            run.current_step = step.id
+            log.info("skill_step_starting",
+                     skill=run.skill_name, step=step.id,
+                     index=f"{i}/{total}", subagent=subagent_name)
 
             start = time.monotonic()
 
@@ -622,38 +735,30 @@ class SkillExecutor:
                         output=f"Unknown step type: {step.type}",
                     )
             except asyncio.TimeoutError:
-                result = StepResult(
-                    step_id=step.id, status="failed", error="Timed out"
-                )
+                result = StepResult(step_id=step.id, status="failed", error="Timed out")
             except Exception as e:
-                result = StepResult(
-                    step_id=step.id, status="failed", error=str(e)
-                )
+                result = StepResult(step_id=step.id, status="failed", error=str(e))
 
             result.duration_ms = int((time.monotonic() - start) * 1000)
             run.step_results.append(result)
+            run.current_step = ""
 
-            status_icon = "✅" if result.status == "success" else "❌"
-            if progress_fn:
-                await progress_fn(
-                    f"{status_icon} {step_label} ({result.duration_ms}ms)"
-                )
+            log.info("skill_step_done",
+                     skill=run.skill_name, step=step.id,
+                     status=result.status, duration_ms=result.duration_ms)
 
-            # Accumulate output for context chaining
             prior_outputs.append(
-                f"Step \"{step.id}\": {result.output[:1000] if result.output else result.error}"
+                f'Step "{step.id}" [{subagent_name}]: {result.output[:1000] if result.output else result.error}'
             )
 
-            # Handle failure policy
             if result.status == "failed":
                 if step.on_failure == "abort":
                     run.status = "failed"
                     run.error = f"Step '{step.id}' failed: {result.error}"
                     break
                 elif step.on_failure == "retry":
-                    # Simple single retry
-                    if progress_fn:
-                        await progress_fn(f"🔄 Retrying {step_label}...")
+                    log.info("skill_step_retrying", skill=run.skill_name, step=step.id)
+                    run.current_step = step.id
                     try:
                         if step.type == "shell":
                             result = await self._run_shell_step(
@@ -661,21 +766,24 @@ class SkillExecutor:
                             )
                         elif step.type == "agent":
                             result = await self._run_agent_step(
-                                step, skill, subagent_runner, prior_outputs, task_context
+                                step, skill, subagent_runner,
+                                prior_outputs, task_context,
                             )
                         result.duration_ms = int((time.monotonic() - start) * 1000)
                         run.step_results[-1] = result
+                        run.current_step = ""
                         if result.status == "failed":
                             run.status = "failed"
-                            run.error = f"Step '{step.id}' failed after retry: {result.error}"
+                            run.error = (
+                                f"Step '{step.id}' failed after retry: {result.error}"
+                            )
                             break
                     except Exception as e:
                         run.status = "failed"
                         run.error = f"Step '{step.id}' retry failed: {e}"
+                        run.current_step = ""
                         break
-                # on_failure == "continue" — just keep going
         else:
-            # All steps completed without abort
             run.status = "success"
 
         run.completed_at = datetime.now(timezone.utc)
@@ -689,12 +797,9 @@ class SkillExecutor:
         task_context: str,
         subagent_runner: "SubagentRunner",
         run: SkillRun,
-        progress_fn: Callable[[str], Awaitable[None]] | None = None,
     ) -> SkillRun:
         """Execute a skill that has no structured steps (original behavior)."""
-        if progress_fn:
-            await progress_fn(f"🔧 Running skill: {skill.name}")
-
+        run.current_step = "main"
         start = time.monotonic()
         prompt = (
             f"## Skill: {skill.name}\n\n"
@@ -704,20 +809,24 @@ class SkillExecutor:
 
         try:
             result = await subagent_runner.run(prompt, context="")
-            run.step_results.append(StepResult(
-                step_id="main",
-                status="success",
-                output=result,
-                duration_ms=int((time.monotonic() - start) * 1000),
-            ))
+            run.step_results.append(
+                StepResult(
+                    step_id="main",
+                    status="success",
+                    output=result,
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
+            )
             run.status = "success"
         except Exception as e:
-            run.step_results.append(StepResult(
-                step_id="main",
-                status="failed",
-                error=str(e),
-                duration_ms=int((time.monotonic() - start) * 1000),
-            ))
+            run.step_results.append(
+                StepResult(
+                    step_id="main",
+                    status="failed",
+                    error=str(e),
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
+            )
             run.status = "failed"
             run.error = str(e)
 
@@ -753,7 +862,13 @@ class SkillExecutor:
         lower = result.lower()
         failed = any(
             marker in lower
-            for marker in ["error:", "failed", "exit code 1", "command not found", "permission denied"]
+            for marker in [
+                "error:",
+                "failed",
+                "exit code 1",
+                "command not found",
+                "permission denied",
+            ]
         )
 
         return StepResult(
@@ -802,7 +917,11 @@ class SkillExecutor:
         if skill.include_step_outputs and run.step_results:
             lines.append("")
             for r in run.step_results:
-                icon = "✅" if r.status == "success" else "❌" if r.status == "failed" else "⏭"
+                icon = (
+                    "✅"
+                    if r.status == "success"
+                    else "❌" if r.status == "failed" else "⏭"
+                )
                 duration = f" ({r.duration_ms}ms)" if r.duration_ms else ""
                 lines.append(f"{icon} **{r.step_id}**{duration}")
                 if r.output and skill.output_format != "summary":

@@ -9,7 +9,7 @@ import structlog
 
 from agent.adapters import cli as cli_adapter, discord as discord_adapter
 
-from agent.config import load_config
+from agent.config import load_config, infer_provider
 from agent.cost_tracker import CostTracker
 from agent.orchestrator import Orchestrator
 from agent.personas import load_personas, apply_persona
@@ -74,39 +74,51 @@ async def main():
     # ── Build subagent runners ────────────────────────────────
     subagent_runners: dict[str, SubagentRunner] = {}
     for name, sa_cfg in cfg.subagents.items():
-        if sa_cfg.provider in providers:
-            # Inject persona into the subagent's personality
-            if name in personas:
-                sa_cfg.personality = apply_persona(sa_cfg.personality, personas[name])
+        provider_name = sa_cfg.resolved_provider
+        primary = providers.get(provider_name)
+        if not primary:
+            log.warning("subagent_skipped_no_provider", name=name, provider=provider_name)
+            continue
 
-            # Inject skills relevant to this subagent
-            relevant_skills = [s for s in skills if s.subagent == name]
-            if relevant_skills:
-                skill_blocks = []
-                for s in relevant_skills:
-                    skill_blocks.append(
-                        f"### Skill: {s.name}\n{s.description}\n\n{s.content}"
-                    )
+        # Resolve fallback provider (SubagentRunner handles retry internally)
+        fallback = None
+        fallback_model = sa_cfg.fallback_model
+        if fallback_model:
+            fallback_name = infer_provider(fallback_model)
+            fallback = providers.get(fallback_name)
+            if fallback is primary:
+                fallback = None  # same provider, no point
 
-                sa_cfg.personality += "\n\n## Skills\n" + "\n\n---\n\n".join(
-                    skill_blocks
-                )
-                log.info("skills_injected", agent=name, count=len(relevant_skills))
+        # Inject persona into the subagent's personality
+        if name in personas:
+            sa_cfg.personality = apply_persona(sa_cfg.personality, personas[name])
 
-            subagent_runners[name] = SubagentRunner(
-                sa_cfg, providers[sa_cfg.provider], cost_tracker=cost_tracker
-            )
-            log.info(
-                "subagent_registered",
-                name=name,
-                provider=sa_cfg.provider,
-                model=sa_cfg.model,
-                has_persona=name in personas,
-            )
-        else:
-            log.warning(
-                "subagent_skipped_no_provider", name=name, provider=sa_cfg.provider
-            )
+        # Inject skills relevant to this subagent
+        relevant_skills = [s for s in skills if s.subagent == name]
+        if relevant_skills:
+            skill_blocks = [
+                f"### Skill: {s.name}\n{s.description}\n\n{s.content}"
+                for s in relevant_skills
+            ]
+            sa_cfg.personality += "\n\n## Skills\n" + "\n\n---\n\n".join(skill_blocks)
+            log.info("skills_injected", agent=name, count=len(relevant_skills))
+
+        subagent_runners[name] = SubagentRunner(
+            sa_cfg,
+            primary,
+            fallback_provider=fallback,
+            fallback_model=fallback_model if fallback else "",
+            cost_tracker=cost_tracker,
+        )
+        log.info(
+            "subagent_registered",
+            name=name,
+            provider=provider_name,
+            native_tools=getattr(primary, "has_native_tools", False),
+            model=sa_cfg.model,
+            fallback=fallback_model if fallback else "none",
+            has_persona=name in personas,
+        )
 
     # ── Build orchestrator ────────────────────────────────────
     # Inject orchestrator persona

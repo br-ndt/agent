@@ -9,7 +9,7 @@ from typing import Callable, Awaitable
 import yaml
 import structlog
 
-from agent.config import Config
+from agent.config import Config, infer_provider
 from agent.cost_tracker import CostTracker
 from agent.providers.base import BaseProvider
 from agent.providers.vision import VisionProvider
@@ -58,10 +58,13 @@ class Orchestrator:
         self.skill_executor = SkillExecutor(self.skill_registry)
         self.skills = self.skill_registry.list_active()
 
+        # Background skill tasks: session_id -> (asyncio.Task, reply_fn)
+        self._skill_tasks: dict[str, tuple[asyncio.Task, Callable]] = {}
+
         # Summarizer: uses cheapest available model
         self._summarizer = self._make_summarizer()
 
-    def get_system_prompt(self) -> str:
+    def get_system_prompt(self, session_id: str = "") -> str:
         """Dynamically build the system prompt with current subagents and skills."""
         agent_list = ", ".join(self.subagents.keys()) if self.subagents else "none"
         skill_catalog = self.skill_registry.build_catalog()
@@ -80,13 +83,22 @@ class Orchestrator:
                 "- <analyze_image>prompt for analysis</analyze_image> — analyze images from user uploads\n"
                 '- <generate_image aspect_ratio="1:1">description</generate_image> — generate images (aspect_ratio: 1:1, 16:9, 9:16, 4:3, 3:4)\n'
                 "- <edit_image>editing instruction</edit_image> — edit the most recently uploaded/generated image\n\n"
-                "Vision triggers: user uploads image, asks to 'describe', 'analyze', 'read', 'generate image', 'create picture', 'draw'.\n"
+                "Vision triggers: user uploads image, asks to 'describe', 'analyze', 'read', 'generate image', 'create picture', 'draw'.\n\n"
+                "IMPORTANT: Unless the user explicitly hits one of these triggers, do NOT use vision capabilities. Always ask the user for clarification if you're unsure whether to use vision features.\n"
+                "DO NOT generate images when:"
+                "  - The user is asking for a skill to be created — these are separate tasks\n"
+                "  - The user is asking you to learn a new skill — again, separate from image generation\n"
+                "  - The user is asking about planning, designing systems, or strategizing\n"
+                "  - The user is asking to write code, create files, or build something\n"
             )
 
         return (
             "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
             "execute code, or use any tools. When a task requires code, files, web pages, or commands, "
             "delegate it to a subagent. Just respond with text.\n\n"
+            "You are in a channel with other bots (marked [BOT]) and other users (marked [USER]).\n"
+            "You CAN tag them to notify them.\n"
+            "You CAN see what they've said if they tag you or mention you by name.\n"
             "## Synthesis Rule\n"
             "When a subagent like 'researcher' reports the content of a page, do not summarize "
             "it too heavily if the user's intent was to see what's on the page. "
@@ -104,12 +116,53 @@ class Orchestrator:
             'To learn a skill, emit: <learn_skill name="name" subagent="subagent_name" '
             'description="short desc">markdown instructions</learn_skill>\n\n'
             "### Proposing a structured skill\n"
-            "When a user says something like 'make that a skill' after a multi-step conversation, "
-            'emit: <propose_skill name="name" subagent="subagent_name" '
-            'description="short desc">YAML steps list</propose_skill>\n\n'
+            "When the user asks you to create a skill with structured steps, use this EXACT format:\n\n"
+            '<propose_skill name="skill-name" subagent="default_subagent" description="One-line description">\n'
+            "- id: step1\n"
+            "  type: agent\n"
+            "  subagent: researcher\n"
+            "  description: What this step does\n"
+            "  prompt: |\n"
+            "    The task for the subagent.\n"
+            "    Can span multiple lines safely.\n\n"
+            "- id: step2\n"
+            "  type: agent\n"
+            "  subagent: planner\n"
+            "  description: What this step does\n"
+            "  prompt: |\n"
+            "    Another task for a different subagent.\n\n"
+            "- id: step3\n"
+            "  type: shell\n"
+            "  description: A shell command step (no subagent needed)\n"
+            "  command: |\n"
+            "    exact shell command to run\n"
+            "</propose_skill>\n\n"
+            "IMPORTANT:\n"
+            "  - Steps must be a YAML list (start with -)\n"
+            "  - Each step needs: id, type, and either 'prompt' (for agent) or 'command' (for shell)\n"
+            "  - Each agent step can have its own 'subagent' field to route to a specific agent. "
+            "If omitted, the skill's top-level subagent is used as the default.\n"
+            f"  - Available subagents: {', '.join(self.subagents.keys()) if self.subagents else 'none'}\n"
+            "  - Always use YAML block scalars (the '|' syntax) for prompt and command values — "
+            "this prevents parse errors when your text contains colons or special characters\n"
+            '  - Do NOT use format "step: agent:" - use proper YAML structure\n'
+            "  - Do NOT generate images when asked to create a skill - these are different tasks\n"
             f"## Available Skills\n{skill_catalog}\n\n"
             f"{vision_instructions}" + prompt
         )
+
+        # Inject live skill status if one is running for this session
+        if session_id:
+            skill_status = self.skill_executor.get_status(session_id)
+            if skill_status:
+                full_prompt += (
+                    "\n\n## Active Skill (running in background)\n"
+                    "A skill is currently running for this user. If they ask about it, "
+                    "report this status. Do NOT re-trigger the skill.\n\n"
+                    f"{skill_status}\n"
+                )
+
+        return full_prompt
 
     async def handle(
         self,
@@ -121,23 +174,21 @@ class Orchestrator:
         images: list[dict] | None = None,
     ) -> dict:
         """Handle a user message. May delegate to subagents or vision operations.
-        
+
         Returns:
             dict with keys:
                 - 'text': str (the text response)
                 - 'images': list[bytes] (any generated/edited images)
         """
+
         # Helper to build return dict
         def make_result(text: str, generated_images: list[bytes] | None = None) -> dict:
-            return {
-                'text': text,
-                'images': generated_images or []
-            }
-        
+            return {"text": text, "images": generated_images or []}
+
         # Resolve provider+model for this tier
         route = tier_route or {}
-        provider_name = route.get("provider", self.config.orchestrator_provider)
         model = route.get("model", self.config.orchestrator_model)
+        provider_name = route.get("provider") or infer_provider(model)
 
         # Look up the provider, fall back to default
         provider = self.providers.get(provider_name, self.provider)
@@ -174,7 +225,7 @@ class Orchestrator:
         start = time.monotonic()
 
         # First pass: let the orchestrator decide what to do
-        system_prompt = self.get_system_prompt()
+        system_prompt = self.get_system_prompt(session_id=session_id)
         response = await provider.complete(
             messages=session.get_messages_for_llm(),
             system=system_prompt,
@@ -211,7 +262,7 @@ class Orchestrator:
         # ── Handle Vision Operations ────────────────────────────────
         vision_results = []
         generated_images = []  # Track images generated this turn
-        
+
         if vision_ops and self.vision_provider:
             for op in vision_ops:
                 try:
@@ -268,7 +319,7 @@ class Orchestrator:
 
                         session.last_generated_image = edited[0]
                         generated_images.append(edited[0])
-                        
+
                         # Don't add to vision_results - image speaks for itself
                         log.info("vision_edit_complete", prompt=op["prompt"][:50])
 
@@ -314,26 +365,36 @@ class Orchestrator:
                 skill = self.skill_registry.get(op["name"])
                 if skill:
                     if skill.has_steps:
-                        # Structured skill — use the executor
-                        subagent = self.subagents.get(skill.subagent)
-                        if subagent:
-                            structured_skill_ran = True
-                            run = await self.skill_executor.execute(
-                                skill=skill,
-                                task_context=op["task"],
-                                subagent_runner=subagent,
-                                session_id=session_id,
-                                triggered_by=session_id,
-                                progress_fn=reply_fn,
-                            )
-                            result_text = self.skill_executor.format_run_result(
-                                skill, run
-                            )
-                            skill_results.append(result_text)
-                        else:
-                            skill_results.append(
-                                f"[Skill System] ERROR: Subagent '{skill.subagent}' not found for skill '{skill.name}'"
-                            )
+                        # Structured skill — run in background so the
+                        # orchestrator stays responsive to messages.
+                        structured_skill_ran = True
+
+                        async def _run_skill_bg(sk=skill, task=op["task"]):
+                            try:
+                                run = await self.skill_executor.execute(
+                                    skill=sk,
+                                    task_context=task,
+                                    subagent_runners=self.subagents,
+                                    session_id=session_id,
+                                    triggered_by=session_id,
+                                )
+                                result_text = self.skill_executor.format_run_result(sk, run)
+                                await reply_fn(result_text)
+                                await session.add_message("assistant", result_text)
+                            except Exception as e:
+                                err = f"Skill '{sk.name}' failed: {e}"
+                                log.error("background_skill_failed", error=str(e))
+                                await reply_fn(err)
+                            finally:
+                                self._skill_tasks.pop(session_id, None)
+
+                        bg_task = asyncio.create_task(_run_skill_bg())
+                        self._skill_tasks[session_id] = (bg_task, reply_fn)
+
+                        skill_results.append(
+                            f"Skill **{skill.name}** is now running in the background "
+                            f"({len(skill.steps)} steps). I'll report results when it finishes."
+                        )
                     else:
                         # Unstructured skill — delegate like before
                         delegations.append(
@@ -355,7 +416,16 @@ class Orchestrator:
 
             elif op["type"] == "propose":
                 try:
-                    steps_data = yaml.safe_load(op["content"])
+                    raw_yaml = op["content"]
+                    # Strip markdown code fences if the LLM wrapped the YAML
+                    raw_yaml = re.sub(r"^```(?:yaml)?\n?", "", raw_yaml.strip(), flags=re.IGNORECASE)
+                    raw_yaml = re.sub(r"\n?```$", "", raw_yaml.strip())
+                    # Skip any leading prose and find the start of the YAML list
+                    list_match = re.search(r"^[ \t]*-[ \t]", raw_yaml, re.MULTILINE)
+                    if list_match:
+                        raw_yaml = raw_yaml[list_match.start():]
+                    log.debug("propose_skill_raw_yaml", content=raw_yaml[:500])
+                    steps_data = yaml.safe_load(raw_yaml)
                     steps = []
                     if isinstance(steps_data, list):
                         for sd in steps_data:
@@ -376,19 +446,22 @@ class Orchestrator:
                         f"Use SKILL APPROVE {op['name']} to activate it."
                     )
                 except Exception as e:
+                    log.error("propose_skill_parse_failed", error=str(e), raw_yaml=op.get("content", "")[:500])
                     skill_results.append(f"[Skill System] ERROR proposing skill: {e}")
 
         # ── Delegation ──────────────────────────────────────────────
         valid_delegations = [d for d in delegations if d["agent"] in self.subagents]
 
         # --- Fast path: vision/skill work already done, no other delegation ---
-        if (vision_results or skill_results or generated_images) and not valid_delegations:
+        if (
+            vision_results or skill_results or generated_images
+        ) and not valid_delegations:
             # If we only generated images with no analysis/errors, send empty text
             if generated_images and not vision_results and not skill_results:
                 final = ""
             else:
                 final = "\n\n".join(vision_results + skill_results)
-            
+
             if final:
                 await session.add_message("assistant", final)
             return make_result(final, generated_images)
@@ -443,7 +516,7 @@ class Orchestrator:
             synth_start = time.monotonic()
             final_response = await provider.complete(
                 messages=session.get_messages_for_llm(),
-                system=self.get_system_prompt(),
+                system=self.get_system_prompt(session_id=session_id),
                 model=model,
                 max_tokens=self.config.orchestrator_max_tokens,
             )
