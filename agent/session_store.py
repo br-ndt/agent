@@ -140,11 +140,16 @@ class PersistentSession:
     """Wraps a single user's conversation with summarization."""
 
     def __init__(
-        self, session_id: str, store: SessionStore, summarizer: Callable | None = None
+        self,
+        session_id: str,
+        store: SessionStore,
+        summarizer: Callable | None = None,
+        memory_store=None,
     ):
         self.session_id = session_id
         self.store = store
         self.summarizer = summarizer  # async fn(messages) -> str
+        self.memory_store = memory_store  # for embedding-based retrieval
 
         self.summary: str = ""
         self.history: list[dict] = []
@@ -234,6 +239,23 @@ class PersistentSession:
             log.error("session_summarize_failed", error=str(e))
             # On failure, just truncate without summary
             pass
+
+        # Also save as a structured memory topic
+        if self.memory_store:
+            try:
+                from agent.memory import build_topic_summary_for_index
+                topic, summary, content = build_topic_summary_for_index(
+                    to_summarize, topic_hint=""
+                )
+                await self.memory_store.save_topic(
+                    session_id=self.session_id,
+                    topic=topic,
+                    summary=summary,
+                    content=content,
+                )
+            except Exception as e:
+                log.warning("memory_topic_save_failed", error=str(e))
+
 
     async def clear(self):
         """Reset the session."""

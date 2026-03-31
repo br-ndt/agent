@@ -11,13 +11,16 @@ from agent.adapters import cli as cli_adapter, discord as discord_adapter
 
 from agent.config import load_config, infer_provider
 from agent.cost_tracker import CostTracker
+from agent.memory import MemoryStore
 from agent.orchestrator import Orchestrator
 from agent.personas import load_personas, apply_persona
 from agent.skills import load_skills
+from agent.persona_enforcement import build_enforced_prompt
 from agent.providers import build_providers, build_resilient_providers
 from agent.providers.vision import VisionProvider  # NEW
 from agent.router import Router
 from agent.session_store import SessionStore
+from agent.state_ledger import StateLedger
 from agent.status_server import configure as configure_status, start_status_server
 from agent.subagent_runner import SubagentRunner
 
@@ -71,6 +74,12 @@ async def main():
     cost_tracker = CostTracker()
     await cost_tracker.init()
 
+    # ── State ledger ───────────────────────────────────────────
+    memory_store = MemoryStore()
+    await memory_store.init()
+    state_ledger = StateLedger()
+    await state_ledger.init()
+
     # ── Build subagent runners ────────────────────────────────
     subagent_runners: dict[str, SubagentRunner] = {}
     for name, sa_cfg in cfg.subagents.items():
@@ -91,7 +100,16 @@ async def main():
 
         # Inject persona into the subagent's personality
         if name in personas:
-            sa_cfg.personality = apply_persona(sa_cfg.personality, personas[name])
+            sa_cfg.personality = build_enforced_prompt(
+                agent_name=name,
+                system_prompt=sa_cfg.personality,
+                persona=personas[name],
+            )
+        else:
+            sa_cfg.personality = build_enforced_prompt(
+                agent_name=name,
+                system_prompt=sa_cfg.personality,
+            )
 
         # Inject skills relevant to this subagent
         relevant_skills = [s for s in skills if s.subagent == name]
@@ -144,7 +162,9 @@ async def main():
         session_store=session_store,
         skills=skills,
         cost_tracker=cost_tracker,
-        vision_provider=vision_provider,  # NEW
+        vision_provider=vision_provider,
+        memory_store=memory_store,
+        state_ledger=state_ledger,
     )
 
     # ── Build router ──────────────────────────────────────────
@@ -216,6 +236,8 @@ async def main():
     log.info("agent_shutting_down")
     await cost_tracker.close()
     await session_store.close()
+    await memory_store.close()
+    await state_ledger.close()
     for name, adapter in router.adapters.items():
         if name != "cli":
             await adapter.stop()

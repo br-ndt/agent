@@ -11,11 +11,13 @@ import structlog
 
 from agent.config import Config, infer_provider
 from agent.cost_tracker import CostTracker
+from agent.diagnostics import ErrorJournal, DiagnosticStore, build_diagnosis_prompt
+from agent.memory import MemoryStore, build_memory_index_prompt
 from agent.providers.base import BaseProvider
 from agent.providers.vision import VisionProvider
+from agent.persona_enforcement import check_output_for_violations
+from agent.sanitizer import sanitize_delegation_result
 from agent.session_store import SessionStore, PersistentSession
-from agent.subagent_runner import SubagentRunner
-from agent.diagnostics import ErrorJournal, DiagnosticStore, build_diagnosis_prompt
 from agent.skills import (
     Skill,
     SkillRegistry,
@@ -26,8 +28,41 @@ from agent.skills import (
     save_proposed_skill,
     load_skills,
 )
+from agent.state_ledger import StateLedger, EntryType
+from agent.subagent_runner import SubagentRunner, WORKSPACES_DIR
 
 log = structlog.get_logger()
+
+
+def _parse_memory_ops(text: str) -> list[dict]:
+    """Extract <recall> and <remember> operations from LLM output."""
+    import re
+
+    ops = []
+
+    # <recall topic="name">reason</recall>
+    recall_pattern = r'<recall\s+topic="([^"]+)">(.*?)</recall>'
+    for topic, reason in re.findall(recall_pattern, text, re.DOTALL):
+        ops.append({"type": "recall", "topic": topic.strip(), "reason": reason.strip()})
+
+    # <remember topic="name" tags="t1,t2" global="true">content</remember>
+    remember_pattern = r'<remember\s+topic="([^"]+)"(?:\s+tags="([^"]*)")?(?:\s+global="([^"]*)")?\s*>(.*?)</remember>'
+    for topic, tags_str, global_str, content in re.findall(
+        remember_pattern, text, re.DOTALL
+    ):
+        tags = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else []
+        is_global = global_str.lower() in ("true", "1", "yes") if global_str else False
+        ops.append(
+            {
+                "type": "remember",
+                "topic": topic.strip(),
+                "content": content.strip(),
+                "tags": tags,
+                "global": is_global,
+            }
+        )
+
+    return ops
 
 
 class Orchestrator:
@@ -41,6 +76,8 @@ class Orchestrator:
         skills: list[Skill] | None = None,
         cost_tracker: CostTracker | None = None,
         vision_provider: VisionProvider | None = None,
+        memory_store: MemoryStore | None = None,
+        state_ledger: StateLedger | None = None,
     ):
         self.provider = provider
         self.providers = providers or {}
@@ -48,6 +85,8 @@ class Orchestrator:
         self.subagents = subagent_runners
         self.cost_tracker = cost_tracker
         self.vision_provider = vision_provider
+        self.memory_store = memory_store
+        self.state_ledger = state_ledger
 
         self.sessions: dict[str, PersistentSession] = {}
         self.session_store = session_store
@@ -134,6 +173,22 @@ class Orchestrator:
             return result
 
         # ── Full tier: skills, vision, learning, proposing ──────────
+        # Memory index injection
+        memory_block = ""
+        if self.memory_store and session_id:
+            import asyncio
+
+            try:
+                loop = asyncio.get_event_loop()
+                pointers = loop.run_until_complete(
+                    self.memory_store.get_index(session_id)
+                )
+                global_pointers = loop.run_until_complete(
+                    self.memory_store.get_global_index()
+                )
+                memory_block = build_memory_index_prompt(pointers, global_pointers)
+            except RuntimeError:
+                pass  # Not in async context, skip
         skill_catalog = self.skill_registry.build_catalog()
 
         vision_instructions = ""
@@ -154,8 +209,7 @@ class Orchestrator:
             )
 
         result = (
-            base
-            + "## Skill System\n"
+            base + "## Skill System\n"
             "You can learn and execute skills.\n\n"
             "### Executing a skill\n"
             "When a user's request matches a known skill (check triggers below), delegate using:\n"
@@ -201,7 +255,7 @@ class Orchestrator:
             "  - Do NOT generate images when asked to create a skill - these are different tasks\n\n"
             "### Fixing / improving skills\n"
             "To fix a broken skill or improve an existing one, delegate to the 'sysadmin' agent:\n"
-            '<delegate agent="sysadmin">Fix the skill \'skill-name\': describe the problem and any error output</delegate>\n\n'
+            "<delegate agent=\"sysadmin\">Fix the skill 'skill-name': describe the problem and any error output</delegate>\n\n"
             "The sysadmin can read agent source code and edit skill files directly.\n\n"
             f"## Available Skills\n{skill_catalog}\n\n"
             f"{vision_instructions}" + prompt
@@ -229,9 +283,7 @@ class Orchestrator:
                 "\n\n## Busy Subagents\n"
                 "These subagents are currently working on tasks. Do NOT delegate "
                 "to them — report that they are busy if the user asks for something "
-                "that would require them.\n\n"
-                + "\n".join(busy_lines)
-                + "\n"
+                "that would require them.\n\n" + "\n".join(busy_lines) + "\n"
             )
 
         return result
@@ -267,8 +319,10 @@ class Orchestrator:
 
         log.info(
             "orchestrator_routing",
-            provider_name=provider_name, model=model,
-            provider_type=type(provider).__name__, tier=tier,
+            provider_name=provider_name,
+            model=model,
+            provider_type=type(provider).__name__,
+            tier=tier,
             has_images=bool(images),
         )
 
@@ -278,12 +332,18 @@ class Orchestrator:
                 session_id=session_id,
                 store=self.session_store,
                 summarizer=self._summarizer,
+                memory_store=self.memory_store,
             )
             self.sessions[session_id] = session
         else:
             session = self.sessions[session_id]
 
         await session.ensure_loaded()
+        memory_index_prompt = ""
+        if self.memory_store:
+            pointers = await self.memory_store.get_index(session_id)
+            global_pointers = await self.memory_store.get_global_index()
+            memory_index_prompt = build_memory_index_prompt(pointers, global_pointers)
 
         if images:
             session.images = images
@@ -308,8 +368,9 @@ class Orchestrator:
                 + "\n]"
             )
             await session.add_message("assistant", context_note)
-            log.info("pending_results_injected", session_id=session_id,
-                     count=len(pending))
+            log.info(
+                "pending_results_injected", session_id=session_id, count=len(pending)
+            )
 
         start = time.monotonic()
 
@@ -325,13 +386,17 @@ class Orchestrator:
                 classify_response = await classify_provider.complete(
                     messages=[{"role": "user", "content": user_msg}],
                     system=self.get_system_prompt(prompt_tier="classify"),
-                    model=classify_model, max_tokens=10, temperature=0.0,
+                    model=classify_model,
+                    max_tokens=10,
+                    temperature=0.0,
                 )
                 msg_class = classify_response.content.strip().upper()
                 if self.cost_tracker:
                     await self.cost_tracker.log_call(
-                        provider=classify_provider_name, model=classify_model,
-                        usage=classify_response.usage, session_id=session_id,
+                        provider=classify_provider_name,
+                        model=classify_model,
+                        usage=classify_response.usage,
+                        session_id=session_id,
                         agent="classifier",
                         duration_ms=int((time.monotonic() - start) * 1000),
                     )
@@ -362,8 +427,12 @@ class Orchestrator:
             route_model, route_provider = model, provider
             route_provider_name = provider_name
 
-        log.info("ingress_tier", classification=msg_class,
-                 prompt_tier=prompt_tier, route_model=route_model)
+        log.info(
+            "ingress_tier",
+            classification=msg_class,
+            prompt_tier=prompt_tier,
+            route_model=route_model,
+        )
 
         # ── Multi-pass loop ─────────────────────────────────────────
         generated_images: list[bytes] = []
@@ -390,31 +459,40 @@ class Orchestrator:
                 pass_provider_name = route_provider_name
 
             system_prompt = self.get_system_prompt(
-                session_id=session_id, prompt_tier=prompt_tier,
+                session_id=session_id,
+                prompt_tier=prompt_tier,
+                memory_index=memory_index_prompt,
             )
             response = await pass_provider.complete(
                 messages=session.get_messages_for_llm(),
-                system=system_prompt, model=pass_model,
+                system=system_prompt,
+                model=pass_model,
                 max_tokens=self.config.orchestrator_max_tokens,
             )
 
             if self.cost_tracker:
                 await self.cost_tracker.log_call(
-                    provider=pass_provider_name, model=pass_model,
-                    usage=response.usage, session_id=session_id,
+                    provider=pass_provider_name,
+                    model=pass_model,
+                    usage=response.usage,
+                    session_id=session_id,
                     agent="orchestrator",
                     duration_ms=int((time.monotonic() - pass_start) * 1000),
                 )
 
-            log.info("orchestrator_pass", pass_num=pass_num,
-                     model=pass_model,
-                     elapsed=f"{time.monotonic() - pass_start:.1f}s",
-                     content_preview=response.content[:300])
+            log.info(
+                "orchestrator_pass",
+                pass_num=pass_num,
+                model=pass_model,
+                elapsed=f"{time.monotonic() - pass_start:.1f}s",
+                content_preview=response.content[:300],
+            )
 
             # ── Parse operations from this pass ─────────────────────
             delegations = _parse_delegations(response.content)
             skill_ops = _parse_skill_ops(response.content)
             vision_ops = _parse_vision_ops(response.content)
+            memory_ops = _parse_memory_ops(response.content)
 
             # Infer skill execution if LLM forgot XML
             if not (session_id in self._skill_tasks) and not any(
@@ -426,7 +504,7 @@ class Orchestrator:
                     log.warning("skill_execution_inferred", skill=inferred["name"])
                     skill_ops.append(inferred)
 
-            has_ops = bool(delegations or skill_ops or vision_ops)
+            has_ops = bool(delegations or skill_ops or vision_ops or memory_ops)
 
             if not has_ops:
                 # No operations — this is the final response
@@ -439,16 +517,27 @@ class Orchestrator:
 
             # Vision
             v_results, v_images = await self._execute_vision_ops(
-                vision_ops, images, session,
+                vision_ops,
+                images,
+                session,
             )
             pass_results.extend(v_results)
             generated_images.extend(v_images)
 
             # Skills (background skills are fire-and-forget)
             s_results, s_delegations, s_structured = await self._execute_skill_ops(
-                skill_ops, session_id, reply_fn, session,
+                skill_ops,
+                session_id,
+                reply_fn,
+                session,
             )
             pass_results.extend(s_results)
+
+            # Memory
+            if memory_ops and self.memory_store:
+                m_results = await self._execute_memory_ops(memory_ops, session_id)
+                pass_results.extend(m_results)
+
             delegations.extend(s_delegations)
             if s_structured:
                 structured_skill_ran = True
@@ -462,7 +551,9 @@ class Orchestrator:
                     notified_delegation = True
 
                 d_results = await self._execute_delegations(
-                    valid_delegations, user_msg, session_id,
+                    valid_delegations,
+                    user_msg,
+                    session_id,
                 )
                 pass_results.extend(d_results)
 
@@ -475,14 +566,16 @@ class Orchestrator:
             # Record this pass's response as assistant, results as user
             await session.add_message("assistant", response.content)
 
-            results_msg = (
-                "Results from this step:\n\n"
-                + "\n\n---\n\n".join(pass_results)
+            results_msg = "Results from this step:\n\n" + "\n\n---\n\n".join(
+                pass_results
             )
             await session.add_message("user", results_msg)
 
-            log.info("pass_results_fed_back", pass_num=pass_num,
-                     result_count=len(pass_results))
+            log.info(
+                "pass_results_fed_back",
+                pass_num=pass_num,
+                result_count=len(pass_results),
+            )
 
             # After last allowed pass, the next iteration will be the
             # final response (or we'll fall through below)
@@ -514,7 +607,9 @@ class Orchestrator:
             try:
                 if op["type"] == "analyze":
                     if not images:
-                        results.append("[Vision] ERROR: No images provided for analysis")
+                        results.append(
+                            "[Vision] ERROR: No images provided for analysis"
+                        )
                         continue
                     if len(images) == 1:
                         r = await self.vision_provider.analyze_image(
@@ -524,7 +619,8 @@ class Orchestrator:
                         )
                     else:
                         r = await self.vision_provider.analyze_multiple_images(
-                            images=images, prompt=op["prompt"],
+                            images=images,
+                            prompt=op["prompt"],
                         )
                     results.append(f"[Vision Analysis]\n{r}")
                     log.info("vision_analysis_complete", prompt=op["prompt"][:50])
@@ -547,7 +643,8 @@ class Orchestrator:
                         results.append("[Vision] ERROR: No image available for editing")
                         continue
                     edited = await self.vision_provider.edit_image(
-                        base_image=base, edit_prompt=op["prompt"],
+                        base_image=base,
+                        edit_prompt=op["prompt"],
                     )
                     session.last_generated_image = edited[0]
                     gen_images.append(edited[0])
@@ -558,6 +655,47 @@ class Orchestrator:
                 log.error("vision_operation_failed", type=op["type"], error=str(e))
 
         return results, gen_images
+
+    async def _execute_memory_ops(self, ops, session_id):
+        """Execute <recall> and <remember> operations."""
+        results = []
+
+        for op in ops:
+            if op["type"] == "recall":
+                topic = await self.memory_store.get_topic(session_id, op["topic"])
+                if topic:
+                    content = topic.content[:2000]  # MAX_TOPIC_CONTENT
+                    results.append(f"[Memory] Recalled '{op['topic']}':\n{content}")
+                else:
+                    # Try searching
+                    matches = await self.memory_store.search_topics(
+                        session_id, op["topic"]
+                    )
+                    if matches:
+                        lines = [
+                            f"[Memory] Topic '{op['topic']}' not found exactly. Similar:"
+                        ]
+                        for m in matches:
+                            lines.append(m.to_index_line())
+                        results.append("\n".join(lines))
+                    else:
+                        results.append(
+                            f"[Memory] No memory found for topic '{op['topic']}'"
+                        )
+
+            elif op["type"] == "remember":
+                await self.memory_store.save_topic(
+                    session_id=session_id,
+                    topic=op["topic"],
+                    summary=op["content"][:150],
+                    content=op["content"],
+                    tags=op.get("tags", []),
+                    global_=op.get("global", False),
+                )
+                scope = "globally" if op.get("global") else "for this session"
+                results.append(f"[Memory] Remembered '{op['topic']}' {scope}")
+
+        return results
 
     async def _execute_skill_ops(
         self,
@@ -579,11 +717,25 @@ class Orchestrator:
             if op["type"] == "learn":
                 try:
                     new_skill = Skill(
-                        name=op["name"], subagent=op["subagent"],
-                        description=op["description"], content=op["content"],
+                        name=op["name"],
+                        subagent=op["subagent"],
+                        description=op["description"],
+                        content=op["content"],
                     )
                     save_skill(new_skill)
                     self.skills.append(new_skill)
+                    if session.memory_store:
+                        try:
+                            await session.memory_store.save_topic(
+                                session_id=session_id,
+                                topic=f"skill-learned-{op['name']}",
+                                summary=f"Learned skill '{op['name']}' for {op['subagent']}",
+                                content=op["content"][:3000],
+                                tags=["skill-definition", op["name"]],
+                                global_=True,  # skill definitions should persist across sessions
+                            )
+                        except Exception:
+                            pass
                     if op["subagent"] in self.subagents:
                         runner = self.subagents[op["subagent"]]
                         skill_block = f"### Skill: {op['name']}\n{op['description']}\n\n{op['content']}"
@@ -595,33 +747,57 @@ class Orchestrator:
                     )
                     log.info("skill_learned", name=op["name"], subagent=op["subagent"])
                 except Exception as e:
-                    results.append(f"[Skill System] ERROR: Failed to learn skill {op['name']}: {e}")
+                    results.append(
+                        f"[Skill System] ERROR: Failed to learn skill {op['name']}: {e}"
+                    )
                     log.error("skill_learn_failed", name=op["name"], error=str(e))
 
             elif op["type"] == "execute":
                 skill = self.skill_registry.get(op["name"])
                 if not skill:
-                    results.append(f"[Skill System] ERROR: Skill '{op['name']}' not found.")
+                    results.append(
+                        f"[Skill System] ERROR: Skill '{op['name']}' not found."
+                    )
                     log.warning("skill_not_found", name=op["name"])
                     continue
 
                 if skill.has_steps:
                     if session_id in self._skill_tasks:
                         status = self.skill_executor.get_status(session_id) or "running"
-                        results.append(f"A skill is already running for this session:\n{status}")
+                        results.append(
+                            f"A skill is already running for this session:\n{status}"
+                        )
                         continue
 
                     structured_ran = True
 
                     async def _run_skill_bg(sk=skill, task=op["task"]):
-                        log.info("background_skill_starting", skill=sk.name, session=session_id)
+                        log.info(
+                            "background_skill_starting",
+                            skill=sk.name,
+                            session=session_id,
+                        )
                         try:
                             run = await self.skill_executor.execute(
-                                skill=sk, task_context=task,
+                                skill=sk,
+                                task_context=task,
                                 subagent_runners=self.subagents,
-                                session_id=session_id, triggered_by=session_id,
+                                session_id=session_id,
+                                triggered_by=session_id,
                             )
                             result_text = self.skill_executor.format_run_result(sk, run)
+                            if session.memory_store:
+                                try:
+                                    await session.memory_store.save_topic(
+                                        session_id=session_id,
+                                        topic=f"skill-run-{sk.name}",
+                                        summary=f"Skill '{sk.name}' {run.status}: {run.error or 'completed successfully'}",
+                                        content=result_text[:5000],
+                                        tags=["skill-result", sk.name],
+                                    )
+                                except Exception:
+                                    pass  # best-effort, don't fail the skill run
+
                             log.info("background_skill_done", skill=sk.name)
                             await reply_fn(result_text)
                             # Store as pending result instead of writing to session
@@ -632,31 +808,47 @@ class Orchestrator:
                             )
                             if run.status == "failed":
                                 failed_step = next(
-                                    (r for r in run.step_results if r.status == "failed"), None,
+                                    (
+                                        r
+                                        for r in run.step_results
+                                        if r.status == "failed"
+                                    ),
+                                    None,
                                 )
                                 self._record_error(
-                                    "skill_run_failed", run.error,
+                                    "skill_run_failed",
+                                    run.error,
                                     skill=sk.name,
                                     step=failed_step.step_id if failed_step else "",
                                 )
                                 await self._auto_diagnose(
-                                    event="skill_run_failed", error=run.error,
-                                    reply_fn=reply_fn, skill_name=sk.name,
+                                    event="skill_run_failed",
+                                    error=run.error,
+                                    reply_fn=reply_fn,
+                                    skill_name=sk.name,
                                     step_id=failed_step.step_id if failed_step else "",
-                                    step_output=failed_step.output if failed_step else "",
+                                    step_output=(
+                                        failed_step.output if failed_step else ""
+                                    ),
                                     context=f"Task: {task}\nFull result:\n{result_text[:3000]}",
                                 )
                         except Exception as e:
                             err = f"Skill '{sk.name}' failed: {e}"
-                            log.error("background_skill_failed", error=str(e), exc_info=True)
-                            self._record_error("background_skill_crashed", str(e), skill=sk.name)
+                            log.error(
+                                "background_skill_failed", error=str(e), exc_info=True
+                            )
+                            self._record_error(
+                                "background_skill_crashed", str(e), skill=sk.name
+                            )
                             await reply_fn(err)
                             self._pending_results.setdefault(session_id, []).append(
                                 f"[Background skill '{sk.name}' FAILED: {e}]"
                             )
                             await self._auto_diagnose(
-                                event="background_skill_crashed", error=str(e),
-                                reply_fn=reply_fn, skill_name=sk.name,
+                                event="background_skill_crashed",
+                                error=str(e),
+                                reply_fn=reply_fn,
+                                skill_name=sk.name,
                                 context=f"Task: {task}",
                             )
                         finally:
@@ -669,11 +861,17 @@ class Orchestrator:
                         f"({len(skill.steps)} steps). I'll report results when it finishes."
                     )
                 else:
-                    extra_delegations.append({
-                        "agent": skill.subagent,
-                        "task": f"Using your skill '{skill.name}', perform the following task: {op['task']}",
-                    })
-                    log.info("skill_execution_triggered", name=skill.name, agent=skill.subagent)
+                    extra_delegations.append(
+                        {
+                            "agent": skill.subagent,
+                            "task": f"Using your skill '{skill.name}', perform the following task: {op['task']}",
+                        }
+                    )
+                    log.info(
+                        "skill_execution_triggered",
+                        name=skill.name,
+                        agent=skill.subagent,
+                    )
 
             elif op["type"] == "propose":
                 if "sysadmin" in self.subagents:
@@ -689,7 +887,9 @@ class Orchestrator:
                         "Write the final SKILL.md with proper YAML frontmatter and steps. "
                         "After writing, read the file back and verify the YAML parses correctly."
                     )
-                    extra_delegations.append({"agent": "sysadmin", "task": sysadmin_prompt})
+                    extra_delegations.append(
+                        {"agent": "sysadmin", "task": sysadmin_prompt}
+                    )
                     results.append(
                         f"[Skill System] Delegating skill proposal '{op['name']}' to sysadmin..."
                     )
@@ -697,20 +897,28 @@ class Orchestrator:
                 else:
                     try:
                         raw_yaml = op["content"]
-                        raw_yaml = re.sub(r"^```(?:yaml)?\n?", "", raw_yaml.strip(), flags=re.IGNORECASE)
+                        raw_yaml = re.sub(
+                            r"^```(?:yaml)?\n?",
+                            "",
+                            raw_yaml.strip(),
+                            flags=re.IGNORECASE,
+                        )
                         raw_yaml = re.sub(r"\n?```$", "", raw_yaml.strip())
                         list_match = re.search(r"^[ \t]*-[ \t]", raw_yaml, re.MULTILINE)
                         if list_match:
-                            raw_yaml = raw_yaml[list_match.start():]
+                            raw_yaml = raw_yaml[list_match.start() :]
                         steps_data = yaml.safe_load(raw_yaml)
                         steps = []
                         if isinstance(steps_data, list):
                             for sd in steps_data:
                                 steps.append(_dict_to_step(sd))
                         new_skill = Skill(
-                            name=op["name"], subagent=op["subagent"],
-                            description=op["description"], steps=steps,
-                            status="proposed", author="bot",
+                            name=op["name"],
+                            subagent=op["subagent"],
+                            description=op["description"],
+                            steps=steps,
+                            status="proposed",
+                            author="bot",
                         )
                         save_proposed_skill(new_skill)
                         self.skill_registry.reload()
@@ -747,8 +955,11 @@ class Orchestrator:
                     f"for session {busy_info.get('session_id', '?')[:20]}. "
                     f"Try again when it's done."
                 )
-                log.info("delegation_skipped_busy", agent=agent_name,
-                         busy_session=busy_info.get("session_id"))
+                log.info(
+                    "delegation_skipped_busy",
+                    agent=agent_name,
+                    busy_session=busy_info.get("session_id"),
+                )
             else:
                 to_run.append(d)
 
@@ -781,21 +992,44 @@ class Orchestrator:
 
         for d, result in zip(to_run, raw_results):
             if isinstance(result, Exception):
-                results.append(f"[{d['agent']}] ERROR: {type(result).__name__}: {result}")
+                results.append(
+                    f"[{d['agent']}] ERROR: {type(result).__name__}: {result}"
+                )
                 log.error("subagent_failed", agent=d["agent"], error=str(result))
                 self._record_error(
-                    "subagent_failed", str(result),
-                    agent=d["agent"], task=d["task"][:500],
+                    "subagent_failed",
+                    str(result),
+                    agent=d["agent"],
+                    task=d["task"][:500],
                     session_id=session_id,
                 )
             else:
-                results.append(f"[{d['agent']}] Result:\n{result}")
+                sanitized = sanitize_delegation_result(d["agent"], result)
+                # validate against ledger
+                if self.state_ledger:
+                    workspace = str(WORKSPACES_DIR / d["agent"])
+                    validation = await self.state_ledger.validate_delegation_result(
+                        agent=d["agent"],
+                        result=sanitized,
+                        workspace=workspace,
+                        session_id=session_id,
+                    )
+                    if validation["issues"]:
+                        sanitized += "\n\n⚠️ Validation issues:\n"
+                        sanitized += "\n".join(f"- {i}" for i in validation["issues"])
+                # Check for persona violations
+                violations = check_output_for_violations(sanitized, d["agent"])
+                if violations:
+                    sanitized += "\n\n⚠️ Persona violations:\n"
+                    sanitized += "\n".join(f"- {v}" for v in violations)
+                results.append(f"[{d['agent']}] Result:\n{sanitized}")
 
         # Fire-and-forget auto-diagnosis for failures
         has_errors = any(isinstance(r, Exception) for r in raw_results)
         if has_errors and "sysadmin" in self.subagents:
             error_summary = "; ".join(
-                f"{d['agent']}: {r}" for d, r in zip(to_run, raw_results)
+                f"{d['agent']}: {r}"
+                for d, r in zip(to_run, raw_results)
                 if isinstance(r, Exception)
             )
             await self._auto_diagnose(
@@ -1010,12 +1244,12 @@ def _strip_thinking(text: str) -> str:
         r"<generate_image(?:\s+[^>]*)?>.*?</generate_image>", "", text, flags=re.DOTALL
     )
     text = re.sub(r"<edit_image>.*?</edit_image>", "", text, flags=re.DOTALL)
+    text = re.sub(r'<recall\s+topic="[^"]*">.*?</recall>', "", text, flags=re.DOTALL)
+    text = re.sub(r'<remember\s+topic="[^"]*"[^>]*>.*?</remember>', "", text, flags=re.DOTALL)
     return text.strip()
 
 
-def _infer_skill_execution(
-    text: str, registry: "SkillRegistry"
-) -> dict | None:
+def _infer_skill_execution(text: str, registry: "SkillRegistry") -> dict | None:
     """Detect when the LLM references running a skill without proper XML.
 
     Returns an execute op dict if a known skill name appears in context

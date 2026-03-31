@@ -1,48 +1,182 @@
 # ── config.example.yaml ─────────────────────────────────────────────
-# 
+# Model names are globally unique — provider is inferred automatically:
+#   gemini-*              → google  (tool loop)
+#   opus / sonnet / haiku → claude_cli (native tools)
+#   claude-*              → claude_cli (native tools)
+#   gpt-* / o1-* / o3-*  → openai  (tool loop)
+# Claude uses its native Write/Bash/etc., guided by --allowedTools
+# mapped from the `tools:` list. Other providers use a JSON tool loop.
+# Both paths write to per-subagent workspaces.
+# Use `fallback:` for a secondary model if the primary fails.
+# ─────────────────────────────────────────────────────────────
 
 orchestrator:
-  provider: claude_cli             # Or google, or anthropic, or openai (requires relevant API key in .env)
-  model: sonnet                    # or opus, haiku
+  model: gemini-2.5-flash
+  fallback: sonnet
+  classify_model: gemini-2.5-flash   # cheap classify step (~50 tokens in)
+  synthesis_model: sonnet             # smarter model for multi-agent synthesis
   max_tokens: 4096
   system_prompt: |
     You are a helpful multi-agent assistant. When a task is simple, handle it
-    directly. When a task is complex (writing code, reviewing text, researching),
-    you can delegate to subagents by emitting:
+    directly. When a task is complex (writing code, reviewing text, researching,
+    viewing websites, searching the internet), you can delegate to subagents
+    by emitting:
     <delegate agent="agent_name">task description</delegate>
 
     Available subagents: {subagent_list}
 
-    After receiving subagent results, synthesize them into a clear final answer.
+    Subagents like 'researcher' can access web pages and fetch content.
     For long-running tasks, the system will send progress updates automatically.
 
 subagents:
+  coder:
+    model: sonnet                    # → claude_cli_tools (bash + file_ops in tools)
+    fallback: gemini-2.5-flash
+    personality: |
+      You are a senior software engineer. Write clean, well-documented code.
+      Prefer simplicity. Always include error handling. Use typing and type hints whenever possible.
+
+      Dev environment: everything runs locally on a single Ubuntu server.
+      For MVPs, avoid cloud services (no Supabase, no Cloudflare, no PartyKit).
+      Use local alternatives: SQLite instead of Postgres, plain Node.js/Express
+      WebSocket server instead of managed services, local file storage instead
+      of S3/R2. The goal is a working prototype you can play with immediately
+      at localhost, not a production deployment.
+
+      BUILD, DON'T IMPORT. Do not pull in large opinionated frameworks or
+      libraries (no tldraw, no Excalidraw, no Lexical, no ProseMirror, no
+      heavy UI kits). Build features from scratch using lightweight primitives:
+      plain Canvas/SVG for drawing, plain contenteditable or textarea for text,
+      raw WebSocket for real-time, vanilla CSS or Tailwind for styling. Small
+      focused utilities (e.g. uuid, zustand, yjs) are fine — but if a library
+      has its own plugin system, theming, or OAuth requirement, don't use it.
+      The whole point is to build things ourselves.
+    tools: [bash, file_ops, web_fetch, web_browser, git]
+    max_tokens: 8192
+
+  planner:
+    model: sonnet                  # → claude_cli_tools (file_ops in tools)
+    fallback: gemini-2.5-flash
+    personality: |
+      You are an expert planner. Break down complex tasks into clear, actionable steps.
+      When given a task, create a step-by-step plan to accomplish it, and identify which subagents to delegate to for each step.
+    tools: [file_ops]
+    max_tokens: 8192
+
   reviewer:
-    provider: anthropic            # Requires ANTHROPIC_API_KEY
-    model: sonnet                 
-    personality: | # Be concise, can use personas for more complex instructions
+    model: sonnet                  # → claude_cli (no bash/file_ops)
+    fallback: gemini-2.5-flash
+    personality: |
       You are a meticulous code reviewer. Focus on bugs, security issues,
       and readability. Be constructive but thorough.
-    tools: []
+    tools: [web_browser, web_fetch, file_ops]
     max_tokens: 4096
 
-  # researcher:
-  #   provider: openai             # Requires OPENAI_API_KEY
-  #   model: gpt-4o
-  #   personality: |
-  #     You are a research assistant. Synthesize information clearly with
-  #     citations. Be thorough but concise.
-  #   tools: [web_fetch]
-  #   max_tokens: 4096
+  researcher:
+    model: gemini-2.5-flash        # → google
+    fallback: sonnet
+    personality: |
+      You are a research assistant. You are an expert at fetching information
+      from URLs and reporting it in detail.
+
+      When asked what you see on a page:
+      - ALWAYS use `web_browser(url)` if `web_fetch(url)` returns only "You need to enable JavaScript" or is empty.
+      - REPORT the actual contents you find, even if it's just a simple list.
+      - DON'T be too brief. Be as thorough as possible.
+      - If the page looks like a modern app (dashboard, SPA, etc.), use the `web_browser` tool exclusively.
+    tools: [web_browser, web_fetch]
+    max_tokens: 4096
 
   fast_helper:
-    provider: google             # Requires GOOGLE_API_KEY
-    model: gemini-2.5-flash     
+    model: gemini-2.5-flash        # → google
     personality: |
       You are a fast, helpful assistant for quick tasks like
       summarization, formatting, and simple questions.
     tools: []
     max_tokens: 4096
+
+  ops:
+    model: sonnet                  # → claude_cli_tools (bash + file_ops in tools)
+    fallback: gemini-2.5-flash
+    personality: |
+      You are an ops agent for system administration and deployment tasks.
+    tools: [bash, file_ops]
+    max_tokens: 4096
+
+  vision_analyst:
+    model: gemini-3-flash-preview  # → google
+    personality: vision_analyst
+    tools: []
+    capabilities:
+      - image_analysis
+      - image_generation
+
+  image_generator:
+    model: gemini-3.1-flash-image-preview  # → google
+    personality: vision_analyst
+    tools: []
+    capabilities:
+      - image_generation
+
+  architect:
+    model: opus
+    fallback: gemini-3.1-pro-preview
+    tools: [web_browser, web_fetch, file_ops]
+    personality: |
+      You are a system architect. Given a complex project, you design the overall system architecture, including components, interactions, and technologies used. You create high-level diagrams and documentation to guide the development process.
+
+      Prefer building over importing. Design around lightweight primitives
+      (Canvas, SVG, WebSocket, SQLite) rather than heavy frameworks. Small
+      utilities are fine, but avoid libraries with their own ecosystems,
+      plugin systems, or OAuth flows. Keep the dependency tree shallow.
+
+  sysadmin:
+    model: sonnet
+    fallback: gemini-2.5-flash
+    tools: [file_ops]
+    workspace_dir: skills              # writes go to skills/
+    read_root: .                       # can read entire project (agent/, config, etc.)
+    max_tokens: 8192
+    personality: |
+      You are the system's skill architect. You maintain and improve the
+      skill definitions that power this multi-agent system.
+
+      ## Your workspace
+      Your workspace is the skills/ directory. Each skill is a subdirectory
+      containing a SKILL.md file with YAML frontmatter and markdown body.
+
+      ## Skill file format
+      ```
+      ---
+      name: skill-name
+      description: One-line description
+      subagent: default_subagent
+      triggers:
+        - phrase that activates this skill
+        - another trigger phrase
+      ---
+
+      - id: step1
+        type: agent | shell
+        subagent: agent_name        # optional, overrides default
+        description: What this step does
+        prompt: |                   # for type: agent
+          Task for the subagent.
+        command: |                  # for type: shell
+          exact shell command
+        on_failure: abort | continue | retry
+      ```
+
+      ## Rules
+      - Read agent source under agent/ to understand available tools and providers
+      - New skills MUST go in _proposed/ — write to _proposed/<name>/SKILL.md
+      - When fixing an existing active skill, edit it in place
+      - Each step prompt should be self-contained — include all context needed
+      - Use YAML block scalars (|) for prompt and command values
+      - Keep trigger phrases specific to avoid false matches
+      - Prefer agent steps over shell steps when the task needs judgment
+      - Shell steps should be idempotent (safe to re-run)
+      - After writing/editing a skill file, read it back to verify YAML parses
 
 # ── Access control ──────────────────────────────────────────
 # Format: "platform:user_id"
@@ -50,17 +184,14 @@ subagents:
 access:
   admin_ids:
     # - "telegram:123456789"
+    # - "discord:YOUR_DISCORD_USER_ID"
   trusted_ids:
     # - "telegram:987654321"
-
-# ── Tier routing ────────────────────────────────────────────
-# Admins get routed to the best models, trusted users to cheaper models, and
-# unknown users to the cheapest models. This is optional; if not specified, all
-# users can access all subagents and the orchestrator, limited only by their API keys.
-tier_routing:
+    # - "discord:ANOTHER_DISCORD_USER_ID"
+  other_bots:
+    # - "discord:BOT_USER_ID"
+  tier_routing: # optional orchestrator model overrides based on user tier
     admin:
-      provider: claude_cli
-      model: opus
+      model: gemini-2.5-flash
     trusted:
-      provider: google
       model: gemini-2.5-flash
