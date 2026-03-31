@@ -192,10 +192,15 @@ class ResilientProvider(BaseProvider):
 
         for attempt in range(self.max_retries + 1):
             try:
-                result = await asyncio.wait_for(
-                    provider.complete(**kwargs),
-                    timeout=self.timeout,
-                )
+                # Providers with native tools (Claude CLI) manage their own
+                # inactivity timeout — don't add a wall-clock timeout on top.
+                if getattr(provider, "has_native_tools", False):
+                    result = await provider.complete(**kwargs)
+                else:
+                    result = await asyncio.wait_for(
+                        provider.complete(**kwargs),
+                        timeout=self.timeout,
+                    )
                 if attempt > 0:
                     log.info("retry_succeeded",
                              provider=label, attempt=attempt + 1)

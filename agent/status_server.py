@@ -327,6 +327,38 @@ def _gather_stats() -> dict:
             ],
         }
 
+    # Session activity
+    if _orchestrator:
+        session_activity = []
+        for sid, session in _orchestrator.sessions.items():
+            activity: dict = {
+                "session_id": sid,
+                "messages": session.message_count,
+            }
+
+            # Active skill
+            if sid in _orchestrator._skill_tasks:
+                skill_status = _orchestrator.skill_executor.get_status(sid)
+                activity["skill"] = skill_status or "running"
+
+            # Pending results waiting to be delivered
+            pending = _orchestrator._pending_results.get(sid, [])
+            if pending:
+                activity["pending_results"] = len(pending)
+
+            session_activity.append(activity)
+
+        # Active delegations (keyed by agent, not session)
+        busy_agents = {}
+        for agent_name, info in _orchestrator._active_delegations.items():
+            busy_agents[agent_name] = {
+                "session_id": info.get("session_id", "?"),
+                "task": info.get("task", "?")[:120],
+            }
+
+        stats["session_activity"] = session_activity
+        stats["busy_agents"] = busy_agents
+
     # Config summary
     if _config:
         stats["config"] = {
@@ -430,6 +462,48 @@ async def handle_index(request):
             <td class="dim">{triggers}</td>
         </tr>"""
 
+    # Build session activity rows
+    session_rows = ""
+    busy_agents = stats.get("busy_agents", {})
+    for sa in stats.get("session_activity", []):
+        sid = sa["session_id"]
+        msg_count = sa.get("messages", 0)
+
+        # Determine status and details
+        if "skill" in sa:
+            status_badge = '<span class="badge unknown">SKILL</span>'
+            # Extract skill name and step from status string
+            detail = sa["skill"]
+            if len(detail) > 120:
+                detail = detail[:120] + "..."
+        elif sa.get("pending_results"):
+            status_badge = '<span class="badge ok">DONE</span>'
+            detail = f"{sa['pending_results']} result(s) waiting"
+        else:
+            status_badge = '<span class="badge unknown">IDLE</span>'
+            detail = "—"
+
+        session_rows += f"""
+        <tr>
+            <td class="mono">{sid}</td>
+            <td class="mono">{msg_count}</td>
+            <td>{status_badge}</td>
+            <td class="dim">{detail}</td>
+        </tr>"""
+
+    # Add busy agent rows
+    for agent_name, info in busy_agents.items():
+        task_preview = info.get("task", "?")
+        if len(task_preview) > 100:
+            task_preview = task_preview[:100] + "..."
+        session_rows += f"""
+        <tr>
+            <td class="mono">{info.get('session_id', '?')}</td>
+            <td>—</td>
+            <td><span class="badge auth">AGENT</span></td>
+            <td class="dim"><strong>{agent_name}</strong>: {task_preview}</td>
+        </tr>"""
+
     # Build skill run history rows
     run_rows = ""
     for run in skill_runs:
@@ -438,6 +512,8 @@ async def handle_index(request):
             status_badge = '<span class="badge ok">OK</span>'
         elif status == "failed":
             status_badge = '<span class="badge error">FAIL</span>'
+        elif status == "no_op":
+            status_badge = '<span class="badge auth">NO-OP</span>'
         else:
             status_badge = f'<span class="badge unknown">{status}</span>'
 
@@ -701,6 +777,16 @@ async def handle_index(request):
   <div class="stat-card">
     <div class="label">Skills</div>
     <div class="value green">{stats.get('skills', {}).get('active_count', 0)}</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Session Activity</h2>
+  <div class="card">
+    <table>
+      <tr><th>Session</th><th>Messages</th><th>Status</th><th>Details</th></tr>
+      {session_rows or '<tr><td colspan="4" class="dim">No active sessions</td></tr>'}
+    </table>
   </div>
 </div>
 

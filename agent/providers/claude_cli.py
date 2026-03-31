@@ -106,24 +106,21 @@ class ClaudeCLIProvider(BaseProvider):
             # Event types: "system", "assistant", "result"
             # We log tool use and text chunks as they arrive,
             # and collect the final "result" event.
+            #
+            # Timeout is per-line (inactivity), not wall-clock. A subagent
+            # that's actively streaming tool results can run for hours — it
+            # only times out if it goes silent for self.timeout seconds.
             result = None
-            import time as _time
-            deadline = _time.monotonic() + self.timeout
 
             while True:
-                remaining = deadline - _time.monotonic()
-                if remaining <= 0:
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
-                    raise asyncio.TimeoutError()
-
                 try:
                     raw_line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=remaining
+                        proc.stdout.readline(), timeout=self.timeout
                     )
                 except asyncio.TimeoutError:
+                    log.error("claude_cli_inactivity_timeout",
+                              timeout=self.timeout,
+                              msg="No output for timeout period")
                     try:
                         proc.kill()
                     except ProcessLookupError:
@@ -217,7 +214,7 @@ class ClaudeCLIProvider(BaseProvider):
                 proc.kill()
             except ProcessLookupError:
                 pass
-            raise RuntimeError(f"claude CLI timed out after {self.timeout}s")
+            raise RuntimeError(f"claude CLI inactive for {self.timeout}s (no output)")
 
         except json.JSONDecodeError as e:
             log.error("claude_cli_json_error", stdout=stdout[:500], error=str(e))

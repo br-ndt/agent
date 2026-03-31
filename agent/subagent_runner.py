@@ -27,7 +27,8 @@ from agent.tools.web_browser import WebBrowserTool
 log = structlog.get_logger()
 
 MAX_TURNS = 15
-WORKSPACES_DIR = Path(__file__).resolve().parent.parent / "workspaces"
+BASE_DIR = Path(__file__).resolve().parent.parent
+WORKSPACES_DIR = BASE_DIR / "workspaces"
 
 # Maps SubagentConfig tool names → Claude Code native tool names
 NATIVE_TOOL_MAP: dict[str, list[str]] = {
@@ -85,8 +86,13 @@ class SubagentRunner:
         has_tools = bool(self.config.tools)
         workspace = None
         if has_tools:
-            workspace = WORKSPACES_DIR / self.config.name
+            if self.config.workspace_dir:
+                workspace = (BASE_DIR / self.config.workspace_dir).resolve()
+            else:
+                workspace = WORKSPACES_DIR / self.config.name
             workspace.mkdir(parents=True, exist_ok=True)
+            if "git" in self.config.tools:
+                _ensure_git_identity(workspace)
 
         log.info(
             "subagent_starting",
@@ -150,6 +156,9 @@ class SubagentRunner:
             f"Your workspace is: {workspace}\n"
             f"Write all output files here (not in _ref/).\n"
         )
+        if self.config.read_root:
+            read_root = (BASE_DIR / self.config.read_root).resolve()
+            workspace_hint += f"You can also read files under: {read_root}\n"
         workspace_hint += _ref_listing(workspace)
 
         log.info(
@@ -225,7 +234,11 @@ class SubagentRunner:
                 allow_git="git" in self.config.tools,
             )
         if "file_ops" in self.config.tools:
-            file_tool = FileOpsTool(workspace=workspace, read_root=WORKSPACES_DIR)
+            if self.config.read_root:
+                read_root = (BASE_DIR / self.config.read_root).resolve()
+            else:
+                read_root = WORKSPACES_DIR
+            file_tool = FileOpsTool(workspace=workspace, read_root=read_root)
         if "web_fetch" in self.config.tools:
             web_tool = WebFetchTool()
         if "web_browser" in self.config.tools:
@@ -370,6 +383,35 @@ class SubagentRunner:
 
 
 # ── Workspace helpers ─────────────────────────────────────────
+
+
+def _ensure_git_identity(workspace: Path):
+    """Set repo-local git identity in any git repo under the workspace.
+
+    Claude Code doesn't propagate env vars to its Bash tool subprocesses,
+    so GIT_AUTHOR_NAME etc. get lost. Repo-local config is authoritative.
+    """
+    import subprocess
+
+    # Find git repos: workspace itself or immediate child dirs
+    candidates = [workspace]
+    candidates.extend(d for d in workspace.iterdir() if d.is_dir() and (d / ".git").exists())
+
+    for repo in candidates:
+        if not (repo / ".git").exists():
+            continue
+        try:
+            subprocess.run(
+                ["git", "config", "user.name", "agent-entro"],
+                cwd=str(repo), check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "agent-entro@users.noreply.github.com"],
+                cwd=str(repo), check=True, capture_output=True,
+            )
+            log.debug("git_identity_set", repo=str(repo))
+        except Exception as e:
+            log.warning("git_identity_failed", repo=str(repo), error=str(e))
 
 
 def _link_sibling_workspaces(workspace: Path, workspaces_dir: Path, self_name: str):

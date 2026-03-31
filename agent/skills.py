@@ -784,7 +784,26 @@ class SkillExecutor:
                         run.current_step = ""
                         break
         else:
-            run.status = "success"
+            # All steps ran without crashing. But check if the final step's
+            # output indicates nothing was actually accomplished.
+            last = run.step_results[-1] if run.step_results else None
+            if last and last.output:
+                out_lower = last.output.lower()
+                no_op_signals = [
+                    "nothing verified",
+                    "no code changes",
+                    "skipping",
+                    "all_complete",
+                    "nothing was implemented",
+                    "no tasks",
+                    "0 tasks",
+                ]
+                if any(sig in out_lower for sig in no_op_signals):
+                    run.status = "no_op"
+                else:
+                    run.status = "success"
+            else:
+                run.status = "success"
 
         run.completed_at = datetime.now(timezone.utc)
         self.registry.record_run(run)
@@ -861,13 +880,12 @@ class SkillExecutor:
         # Heuristic: if the subagent reports an error, mark as failed
         lower = result.lower()
         failed = any(
-            marker in lower
-            for marker in [
-                "error:",
-                "failed",
-                "exit code 1",
-                "command not found",
-                "permission denied",
+            re.search(pattern, lower)
+            for pattern in [
+                r"(?:^|\n)\s*error:",          # "error:" at line start, not mid-word
+                r"command not found",
+                r"permission denied",
+                r"exit code [1-9]\b",           # exit code 1-9 (not 0, not 144 matching "1")
             ]
         )
 
@@ -897,9 +915,36 @@ class SkillExecutor:
 
         result = await subagent_runner.run(prompt, context=task_context)
 
+        # Detect when the step ran but its output indicates nothing was accomplished.
+        # Uses "no_op" (not "failed") so on_failure:abort doesn't kill the run —
+        # downstream steps can still handle the empty result gracefully.
+        status = "success"
+        result_lower = result.lower()
+
+        no_op_signals = [
+            "nothing verified",
+            "no code changes",
+            "skipping",
+            "all_complete",
+            "nothing was implemented",
+            "no tasks passed",
+            "no verified tasks",
+            "0 verified",
+        ]
+        # "all 6 tasks FAIL" / "none of the tasks passed"
+        has_total_failure = (
+            ("all" in result_lower or "none" in result_lower)
+            and any(w in result_lower for w in ["fail", "reject", "not pass"])
+        )
+        # Empty verified_tasks block
+        has_empty_block = "```verified_tasks\n```" in result or "```verified_tasks\n\n```" in result
+
+        if has_total_failure or has_empty_block or any(sig in result_lower for sig in no_op_signals):
+            status = "no_op"
+
         return StepResult(
             step_id=step.id,
-            status="success",
+            status=status,
             output=result,
         )
 
@@ -909,9 +954,9 @@ class SkillExecutor:
         The final step's output is treated as the skill's deliverable and
         included in full. Earlier steps are shown as status lines only.
         """
-        status_icon = {"success": "✅", "failed": "❌", "aborted": "⛔"}.get(
-            run.status, "❓"
-        )
+        status_icon = {
+            "success": "✅", "failed": "❌", "aborted": "⛔", "no_op": "⚠️",
+        }.get(run.status, "❓")
 
         lines = [f"{status_icon} Skill **{skill.name}** — {run.status}"]
 

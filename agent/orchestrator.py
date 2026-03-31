@@ -15,6 +15,7 @@ from agent.providers.base import BaseProvider
 from agent.providers.vision import VisionProvider
 from agent.session_store import SessionStore, PersistentSession
 from agent.subagent_runner import SubagentRunner
+from agent.diagnostics import ErrorJournal, DiagnosticStore, build_diagnosis_prompt
 from agent.skills import (
     Skill,
     SkillRegistry,
@@ -61,19 +62,79 @@ class Orchestrator:
         # Background skill tasks: session_id -> (asyncio.Task, reply_fn)
         self._skill_tasks: dict[str, tuple[asyncio.Task, Callable]] = {}
 
+        # Active subagent delegations: agent_name -> {task, session_id, description}
+        self._active_delegations: dict[str, dict] = {}
+
+        # Pending background results: session_id -> list of result strings
+        # These are results from background tasks that completed while the user
+        # was in a different conversation turn. Injected as context, not into
+        # session history directly.
+        self._pending_results: dict[str, list[str]] = {}
+
+        # Diagnostics
+        self.error_journal = ErrorJournal()
+        self.diagnostic_store = DiagnosticStore()
+
         # Summarizer: uses cheapest available model
         self._summarizer = self._make_summarizer()
 
-    def get_system_prompt(self, session_id: str = "") -> str:
-        """Dynamically build the system prompt with current subagents and skills."""
+    def get_system_prompt(self, session_id: str = "", prompt_tier: str = "full") -> str:
+        """Dynamically build the system prompt with current subagents and skills.
+
+        prompt_tier controls how much context is included:
+          - "classify": Bare minimum for message classification (~50 tokens)
+          - "minimal":  Personality + subagent list + delegation syntax (no skills/vision)
+          - "full":     Everything (skills, vision, learning, proposing)
+        """
+        if prompt_tier == "classify":
+            return (
+                "Classify this message into one category:\n"
+                "- SIMPLE: greetings, small talk, factual questions, math, formatting, "
+                "simple opinions, short answers\n"
+                "- DELEGATE: needs code, research, web access, file ops, image work, "
+                "or matches a known skill\n"
+                "- COMPLEX: nuanced analysis, architecture, multi-step reasoning, "
+                "debate, detailed explanations, synthesis of multiple topics\n\n"
+                "Reply with ONLY the category name, nothing else."
+            )
+
         agent_list = ", ".join(self.subagents.keys()) if self.subagents else "none"
-        skill_catalog = self.skill_registry.build_catalog()
 
         prompt = self.config.orchestrator_system_prompt.replace(
             "{subagent_list}", agent_list
         )
         # Remove old {skill_list} placeholder if present
         prompt = prompt.replace("{skill_list}", "see below")
+
+        base = (
+            "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
+            "execute code, or use any tools. When a task requires code, files, web pages, or commands, "
+            "delegate it to a subagent. Just respond with text.\n\n"
+            "You are in a channel with other bots (marked [BOT]) and other users (marked [USER]).\n"
+            "You CAN tag them to notify them.\n"
+            "You CAN see what they've said if they tag you or mention you by name.\n\n"
+            "After each operation you request (delegation, vision, etc.), you will see the "
+            "results and can decide what to do next — request more operations or respond to the "
+            "user. You don't need to plan everything upfront; you can gather information first "
+            "and act on it after.\n\n"
+            "## Synthesis Rule\n"
+            "When a subagent like 'researcher' reports the content of a page, do not summarize "
+            "it too heavily if the user's intent was to see what's on the page. "
+            "Provide a thorough report of the actual contents found.\n\n"
+        )
+
+        if prompt_tier == "minimal":
+            # Delegation syntax only — no skills, vision, or learning
+            base += (
+                "When a task requires delegation, emit:\n"
+                '<delegate agent="agent_name">task description</delegate>\n\n'
+                f"Available subagents: {agent_list}\n\n"
+            )
+            result = base + prompt
+            return result
+
+        # ── Full tier: skills, vision, learning, proposing ──────────
+        skill_catalog = self.skill_registry.build_catalog()
 
         vision_instructions = ""
         if self.vision_provider:
@@ -92,18 +153,9 @@ class Orchestrator:
                 "  - The user is asking to write code, create files, or build something\n"
             )
 
-        return (
-            "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
-            "execute code, or use any tools. When a task requires code, files, web pages, or commands, "
-            "delegate it to a subagent. Just respond with text.\n\n"
-            "You are in a channel with other bots (marked [BOT]) and other users (marked [USER]).\n"
-            "You CAN tag them to notify them.\n"
-            "You CAN see what they've said if they tag you or mention you by name.\n"
-            "## Synthesis Rule\n"
-            "When a subagent like 'researcher' reports the content of a page, do not summarize "
-            "it too heavily if the user's intent was to see what's on the page. "
-            "Provide a thorough report of the actual contents found.\n\n"
-            "## Skill System\n"
+        result = (
+            base
+            + "## Skill System\n"
             "You can learn and execute skills.\n\n"
             "### Executing a skill\n"
             "When a user's request matches a known skill (check triggers below), delegate using:\n"
@@ -146,7 +198,11 @@ class Orchestrator:
             "  - Always use YAML block scalars (the '|' syntax) for prompt and command values — "
             "this prevents parse errors when your text contains colons or special characters\n"
             '  - Do NOT use format "step: agent:" - use proper YAML structure\n'
-            "  - Do NOT generate images when asked to create a skill - these are different tasks\n"
+            "  - Do NOT generate images when asked to create a skill - these are different tasks\n\n"
+            "### Fixing / improving skills\n"
+            "To fix a broken skill or improve an existing one, delegate to the 'sysadmin' agent:\n"
+            '<delegate agent="sysadmin">Fix the skill \'skill-name\': describe the problem and any error output</delegate>\n\n'
+            "The sysadmin can read agent source code and edit skill files directly.\n\n"
             f"## Available Skills\n{skill_catalog}\n\n"
             f"{vision_instructions}" + prompt
         )
@@ -155,14 +211,32 @@ class Orchestrator:
         if session_id:
             skill_status = self.skill_executor.get_status(session_id)
             if skill_status:
-                full_prompt += (
+                result += (
                     "\n\n## Active Skill (running in background)\n"
                     "A skill is currently running for this user. If they ask about it, "
                     "report this status. Do NOT re-trigger the skill.\n\n"
                     f"{skill_status}\n"
                 )
 
-        return full_prompt
+        # Inject busy subagent status
+        if self._active_delegations:
+            busy_lines = []
+            for agent_name, info in self._active_delegations.items():
+                busy_lines.append(
+                    f"- **{agent_name}**: working on: {info.get('task', '?')[:100]}"
+                )
+            result += (
+                "\n\n## Busy Subagents\n"
+                "These subagents are currently working on tasks. Do NOT delegate "
+                "to them — report that they are busy if the user asks for something "
+                "that would require them.\n\n"
+                + "\n".join(busy_lines)
+                + "\n"
+            )
+
+        return result
+
+    MAX_PASSES = 4
 
     async def handle(
         self,
@@ -173,36 +247,32 @@ class Orchestrator:
         tier_route: dict[str, str] | None = None,
         images: list[dict] | None = None,
     ) -> dict:
-        """Handle a user message. May delegate to subagents or vision operations.
+        """Handle a user message via multi-pass orchestration.
 
-        Returns:
-            dict with keys:
-                - 'text': str (the text response)
-                - 'images': list[bytes] (any generated/edited images)
+        Each pass: LLM decides what to do → operations execute → results
+        feed back as context. Loop ends when the LLM responds directly
+        (no operations) or max passes reached.
+
+        Returns dict with 'text' and 'images' keys.
         """
 
-        # Helper to build return dict
-        def make_result(text: str, generated_images: list[bytes] | None = None) -> dict:
-            return {"text": text, "images": generated_images or []}
+        def make_result(text: str, gen_images: list[bytes] | None = None) -> dict:
+            return {"text": text, "images": gen_images or []}
 
-        # Resolve provider+model for this tier
+        # ── Resolve provider + model for this tier ──────────────────
         route = tier_route or {}
         model = route.get("model", self.config.orchestrator_model)
         provider_name = route.get("provider") or infer_provider(model)
-
-        # Look up the provider, fall back to default
         provider = self.providers.get(provider_name, self.provider)
+
         log.info(
             "orchestrator_routing",
-            provider_name=provider_name,
-            model=model,
-            provider_type=type(provider).__name__,
-            tier=tier,
-            tier_route=tier_route,
-            providers_keys=list(self.providers.keys()),
+            provider_name=provider_name, model=model,
+            provider_type=type(provider).__name__, tier=tier,
             has_images=bool(images),
         )
 
+        # ── Session setup ───────────────────────────────────────────
         if session_id not in self.sessions:
             session = PersistentSession(
                 session_id=session_id,
@@ -215,335 +285,573 @@ class Orchestrator:
 
         await session.ensure_loaded()
 
-        # Store images in session context if provided
         if images:
             session.images = images
             log.info("images_received", count=len(images))
+            # Tell the orchestrator LLM that images are attached — it can't
+            # see them directly, but it needs to know they're there so it can
+            # decide to emit <analyze_image>.
+            filenames = [img.get("filename", "image") for img in images]
+            user_msg = (
+                f"[{len(images)} image(s) attached: {', '.join(filenames)}]\n\n"
+                + user_msg
+            )
 
         await session.add_message("user", user_msg)
 
+        # Drain any pending background results into session context
+        pending = self._pending_results.pop(session_id, [])
+        if pending:
+            context_note = (
+                "[Background tasks completed since your last message:\n"
+                + "\n---\n".join(pending)
+                + "\n]"
+            )
+            await session.add_message("assistant", context_note)
+            log.info("pending_results_injected", session_id=session_id,
+                     count=len(pending))
+
         start = time.monotonic()
 
-        # First pass: let the orchestrator decide what to do
-        system_prompt = self.get_system_prompt(session_id=session_id)
-        response = await provider.complete(
-            messages=session.get_messages_for_llm(),
-            system=system_prompt,
-            model=model,
-            max_tokens=self.config.orchestrator_max_tokens,
-        )
-        if self.cost_tracker:
-            await self.cost_tracker.log_call(
-                provider=provider_name,
-                model=model,
-                usage=response.usage,
-                session_id=session_id,
-                agent="orchestrator",
-                duration_ms=int((time.monotonic() - start) * 1000),
+        # ── Classification ──────────────────────────────────────────
+        classify_model = self.config.classify_model or model
+        classify_provider_name = infer_provider(classify_model)
+        classify_provider = self.providers.get(classify_provider_name, provider)
+
+        if images:
+            msg_class = "DELEGATE"
+        else:
+            try:
+                classify_response = await classify_provider.complete(
+                    messages=[{"role": "user", "content": user_msg}],
+                    system=self.get_system_prompt(prompt_tier="classify"),
+                    model=classify_model, max_tokens=10, temperature=0.0,
+                )
+                msg_class = classify_response.content.strip().upper()
+                if self.cost_tracker:
+                    await self.cost_tracker.log_call(
+                        provider=classify_provider_name, model=classify_model,
+                        usage=classify_response.usage, session_id=session_id,
+                        agent="classifier",
+                        duration_ms=int((time.monotonic() - start) * 1000),
+                    )
+                if msg_class not in ("SIMPLE", "DELEGATE", "COMPLEX"):
+                    msg_class = "DELEGATE"
+                log.info("classify_result", classification=msg_class)
+            except Exception as e:
+                log.warning("classify_failed", error=str(e))
+                msg_class = "DELEGATE"
+
+        # ── Select model + prompt tier ──────────────────────────────
+        if msg_class == "SIMPLE":
+            prompt_tier = "minimal"
+            route_model, route_provider = model, provider
+            route_provider_name = provider_name
+        elif msg_class == "COMPLEX":
+            prompt_tier = "full"
+            fallback = self.config.orchestrator_fallback_model
+            if fallback:
+                route_model = fallback
+                route_provider_name = infer_provider(fallback)
+                route_provider = self.providers.get(route_provider_name, provider)
+            else:
+                route_model, route_provider = model, provider
+                route_provider_name = provider_name
+        else:
+            prompt_tier = "full"
+            route_model, route_provider = model, provider
+            route_provider_name = provider_name
+
+        log.info("ingress_tier", classification=msg_class,
+                 prompt_tier=prompt_tier, route_model=route_model)
+
+        # ── Multi-pass loop ─────────────────────────────────────────
+        generated_images: list[bytes] = []
+        structured_skill_ran = False
+        notified_delegation = False
+        final = ""
+
+        for pass_num in range(self.MAX_PASSES):
+            pass_start = time.monotonic()
+
+            # Use smarter model for synthesis passes (pass > 0)
+            if pass_num > 0:
+                synth_model = (
+                    self.config.synthesis_model
+                    or self.config.orchestrator_fallback_model
+                    or route_model
+                )
+                synth_provider_name = infer_provider(synth_model)
+                synth_provider = self.providers.get(synth_provider_name, route_provider)
+                pass_model, pass_provider = synth_model, synth_provider
+                pass_provider_name = synth_provider_name
+            else:
+                pass_model, pass_provider = route_model, route_provider
+                pass_provider_name = route_provider_name
+
+            system_prompt = self.get_system_prompt(
+                session_id=session_id, prompt_tier=prompt_tier,
             )
-        log.info("orchestrator_raw_response", content=response.content[:500])
+            response = await pass_provider.complete(
+                messages=session.get_messages_for_llm(),
+                system=system_prompt, model=pass_model,
+                max_tokens=self.config.orchestrator_max_tokens,
+            )
 
-        elapsed = time.monotonic() - start
-        log.info(
-            "orchestrator_response", elapsed=f"{elapsed:.1f}s", usage=response.usage
-        )
+            if self.cost_tracker:
+                await self.cost_tracker.log_call(
+                    provider=pass_provider_name, model=pass_model,
+                    usage=response.usage, session_id=session_id,
+                    agent="orchestrator",
+                    duration_ms=int((time.monotonic() - pass_start) * 1000),
+                )
 
-        # Check for delegation blocks
-        delegations = _parse_delegations(response.content)
-        skill_ops = _parse_skill_ops(response.content)
-        vision_ops = _parse_vision_ops(response.content)
+            log.info("orchestrator_pass", pass_num=pass_num,
+                     model=pass_model,
+                     elapsed=f"{time.monotonic() - pass_start:.1f}s",
+                     content_preview=response.content[:300])
 
-        if not delegations and not skill_ops and not vision_ops:
-            # Direct response — no delegation needed
+            # ── Parse operations from this pass ─────────────────────
+            delegations = _parse_delegations(response.content)
+            skill_ops = _parse_skill_ops(response.content)
+            vision_ops = _parse_vision_ops(response.content)
+
+            # Infer skill execution if LLM forgot XML
+            if not (session_id in self._skill_tasks) and not any(
+                op["type"] == "execute" for op in skill_ops
+            ):
+                inferred = _infer_skill_execution(response.content, self.skill_registry)
+                if inferred:
+                    inferred["task"] = user_msg
+                    log.warning("skill_execution_inferred", skill=inferred["name"])
+                    skill_ops.append(inferred)
+
+            has_ops = bool(delegations or skill_ops or vision_ops)
+
+            if not has_ops:
+                # No operations — this is the final response
+                final = _strip_thinking(response.content)
+                await session.add_message("assistant", final)
+                break
+
+            # ── Execute operations for this pass ────────────────────
+            pass_results: list[str] = []
+
+            # Vision
+            v_results, v_images = await self._execute_vision_ops(
+                vision_ops, images, session,
+            )
+            pass_results.extend(v_results)
+            generated_images.extend(v_images)
+
+            # Skills (background skills are fire-and-forget)
+            s_results, s_delegations, s_structured = await self._execute_skill_ops(
+                skill_ops, session_id, reply_fn, session,
+            )
+            pass_results.extend(s_results)
+            delegations.extend(s_delegations)
+            if s_structured:
+                structured_skill_ran = True
+
+            # Delegations
+            valid_delegations = [d for d in delegations if d["agent"] in self.subagents]
+
+            if valid_delegations:
+                if not notified_delegation and not structured_skill_ran:
+                    await reply_fn(_summarize_delegations(valid_delegations))
+                    notified_delegation = True
+
+                d_results = await self._execute_delegations(
+                    valid_delegations, user_msg, session_id,
+                )
+                pass_results.extend(d_results)
+
+            # ── If only images generated with no text results, return ──
+            if generated_images and not pass_results:
+                await session.add_message("assistant", "")
+                return make_result("", generated_images)
+
+            # ── Feed results back for next pass ─────────────────────
+            # Record this pass's response as assistant, results as user
+            await session.add_message("assistant", response.content)
+
+            results_msg = (
+                "Results from this step:\n\n"
+                + "\n\n---\n\n".join(pass_results)
+            )
+            await session.add_message("user", results_msg)
+
+            log.info("pass_results_fed_back", pass_num=pass_num,
+                     result_count=len(pass_results))
+
+            # After last allowed pass, the next iteration will be the
+            # final response (or we'll fall through below)
+
+        else:
+            # Exhausted all passes — use last response as-is
+            log.warning("max_passes_reached", passes=self.MAX_PASSES)
             final = _strip_thinking(response.content)
             await session.add_message("assistant", final)
-            return make_result(final)
 
-        # ── Handle Vision Operations ────────────────────────────────
-        vision_results = []
-        generated_images = []  # Track images generated this turn
+        return make_result(final, generated_images)
 
-        if vision_ops and self.vision_provider:
-            for op in vision_ops:
-                try:
-                    if op["type"] == "analyze":
-                        if not images:
-                            vision_results.append(
-                                "[Vision] ERROR: No images provided for analysis"
-                            )
-                            continue
+    # ── Execution helpers (called from the multi-pass loop) ─────
 
-                        if len(images) == 1:
-                            result = await self.vision_provider.analyze_image(
-                                image_data=images[0]["data"],
-                                prompt=op["prompt"],
-                                mime_type=images[0].get("mime_type", "image/jpeg"),
-                            )
-                        else:
-                            result = await self.vision_provider.analyze_multiple_images(
-                                images=images, prompt=op["prompt"]
-                            )
+    async def _execute_vision_ops(
+        self,
+        vision_ops: list[dict],
+        images: list[dict] | None,
+        session: PersistentSession,
+    ) -> tuple[list[str], list[bytes]]:
+        """Run vision operations. Returns (text_results, generated_images)."""
+        results: list[str] = []
+        gen_images: list[bytes] = []
 
-                        vision_results.append(f"[Vision Analysis]\n{result}")
-                        log.info("vision_analysis_complete", prompt=op["prompt"][:50])
+        if not vision_ops or not self.vision_provider:
+            return results, gen_images
 
-                    elif op["type"] == "generate":
-                        gen_images = await self.vision_provider.generate_image(
+        for op in vision_ops:
+            try:
+                if op["type"] == "analyze":
+                    if not images:
+                        results.append("[Vision] ERROR: No images provided for analysis")
+                        continue
+                    if len(images) == 1:
+                        r = await self.vision_provider.analyze_image(
+                            image_data=images[0]["data"],
                             prompt=op["prompt"],
-                            aspect_ratio=op.get("aspect_ratio", "1:1"),
-                            num_images=1,
+                            mime_type=images[0].get("mime_type", "image/jpeg"),
                         )
-
-                        # Store for editing and return
-                        session.last_generated_image = gen_images[0]
-                        generated_images.append(gen_images[0])
-
-                        # Don't add to vision_results - image speaks for itself
-                        # Don't call reply_fn - let the image be the response
-                        log.info("vision_generation_complete", prompt=op["prompt"][:50])
-
-                    elif op["type"] == "edit":
-                        base_image = getattr(session, "last_generated_image", None)
-                        if not base_image and images:
-                            base_image = images[-1]["data"]
-
-                        if not base_image:
-                            vision_results.append(
-                                "[Vision] ERROR: No image available for editing"
-                            )
-                            continue
-
-                        edited = await self.vision_provider.edit_image(
-                            base_image=base_image, edit_prompt=op["prompt"]
+                    else:
+                        r = await self.vision_provider.analyze_multiple_images(
+                            images=images, prompt=op["prompt"],
                         )
+                    results.append(f"[Vision Analysis]\n{r}")
+                    log.info("vision_analysis_complete", prompt=op["prompt"][:50])
 
-                        session.last_generated_image = edited[0]
-                        generated_images.append(edited[0])
+                elif op["type"] == "generate":
+                    gen = await self.vision_provider.generate_image(
+                        prompt=op["prompt"],
+                        aspect_ratio=op.get("aspect_ratio", "1:1"),
+                        num_images=1,
+                    )
+                    session.last_generated_image = gen[0]
+                    gen_images.append(gen[0])
+                    log.info("vision_generation_complete", prompt=op["prompt"][:50])
 
-                        # Don't add to vision_results - image speaks for itself
-                        log.info("vision_edit_complete", prompt=op["prompt"][:50])
+                elif op["type"] == "edit":
+                    base = getattr(session, "last_generated_image", None)
+                    if not base and images:
+                        base = images[-1]["data"]
+                    if not base:
+                        results.append("[Vision] ERROR: No image available for editing")
+                        continue
+                    edited = await self.vision_provider.edit_image(
+                        base_image=base, edit_prompt=op["prompt"],
+                    )
+                    session.last_generated_image = edited[0]
+                    gen_images.append(edited[0])
+                    log.info("vision_edit_complete", prompt=op["prompt"][:50])
 
-                except Exception as e:
-                    vision_results.append(f"[Vision] ERROR: {type(e).__name__}: {e}")
-                    log.error("vision_operation_failed", type=op["type"], error=str(e))
+            except Exception as e:
+                results.append(f"[Vision] ERROR: {type(e).__name__}: {e}")
+                log.error("vision_operation_failed", type=op["type"], error=str(e))
 
-        # ── Handle Skill Operations ─────────────────────────────────
-        skill_results = []
-        structured_skill_ran = False
+        return results, gen_images
+
+    async def _execute_skill_ops(
+        self,
+        skill_ops: list[dict],
+        session_id: str,
+        reply_fn: Callable[[str], Awaitable[None]],
+        session: PersistentSession,
+    ) -> tuple[list[str], list[dict], bool]:
+        """Run skill operations.
+
+        Returns (results, extra_delegations, structured_skill_ran).
+        extra_delegations are added to the delegation list for this pass.
+        """
+        results: list[str] = []
+        extra_delegations: list[dict] = []
+        structured_ran = False
 
         for op in skill_ops:
             if op["type"] == "learn":
                 try:
                     new_skill = Skill(
-                        name=op["name"],
-                        subagent=op["subagent"],
-                        description=op["description"],
-                        content=op["content"],
+                        name=op["name"], subagent=op["subagent"],
+                        description=op["description"], content=op["content"],
                     )
                     save_skill(new_skill)
                     self.skills.append(new_skill)
-
-                    # Update relevant subagent runner personality
                     if op["subagent"] in self.subagents:
                         runner = self.subagents[op["subagent"]]
                         skill_block = f"### Skill: {op['name']}\n{op['description']}\n\n{op['content']}"
                         if "## Skills" not in runner.config.personality:
                             runner.config.personality += "\n\n## Skills\n"
                         runner.config.personality += f"\n\n---\n\n{skill_block}"
-
-                    skill_results.append(
+                    results.append(
                         f"[Skill System] Successfully learned new skill: {op['name']} for subagent {op['subagent']}"
                     )
                     log.info("skill_learned", name=op["name"], subagent=op["subagent"])
                 except Exception as e:
-                    skill_results.append(
-                        f"[Skill System] ERROR: Failed to learn skill {op['name']}: {e}"
-                    )
+                    results.append(f"[Skill System] ERROR: Failed to learn skill {op['name']}: {e}")
                     log.error("skill_learn_failed", name=op["name"], error=str(e))
 
             elif op["type"] == "execute":
                 skill = self.skill_registry.get(op["name"])
-                if skill:
-                    if skill.has_steps:
-                        # Structured skill — run in background so the
-                        # orchestrator stays responsive to messages.
-                        structured_skill_ran = True
-
-                        async def _run_skill_bg(sk=skill, task=op["task"]):
-                            log.info("background_skill_starting", skill=sk.name, session=session_id)
-                            try:
-                                run = await self.skill_executor.execute(
-                                    skill=sk,
-                                    task_context=task,
-                                    subagent_runners=self.subagents,
-                                    session_id=session_id,
-                                    triggered_by=session_id,
-                                )
-                                result_text = self.skill_executor.format_run_result(sk, run)
-                                log.info("background_skill_done", skill=sk.name, result_len=len(result_text))
-                                await reply_fn(result_text)
-                                await session.add_message("assistant", result_text)
-                            except Exception as e:
-                                err = f"Skill '{sk.name}' failed: {e}"
-                                log.error("background_skill_failed", error=str(e), exc_info=True)
-                                await reply_fn(err)
-                            finally:
-                                self._skill_tasks.pop(session_id, None)
-
-                        bg_task = asyncio.create_task(_run_skill_bg())
-                        self._skill_tasks[session_id] = (bg_task, reply_fn)
-
-                        skill_results.append(
-                            f"Skill **{skill.name}** is now running in the background "
-                            f"({len(skill.steps)} steps). I'll report results when it finishes."
-                        )
-                    else:
-                        # Unstructured skill — delegate like before
-                        delegations.append(
-                            {
-                                "agent": skill.subagent,
-                                "task": f"Using your skill '{skill.name}', perform the following task: {op['task']}",
-                            }
-                        )
-                        log.info(
-                            "skill_execution_triggered",
-                            name=skill.name,
-                            agent=skill.subagent,
-                        )
-                else:
-                    skill_results.append(
-                        f"[Skill System] ERROR: Skill '{op['name']}' not found."
-                    )
+                if not skill:
+                    results.append(f"[Skill System] ERROR: Skill '{op['name']}' not found.")
                     log.warning("skill_not_found", name=op["name"])
+                    continue
+
+                if skill.has_steps:
+                    if session_id in self._skill_tasks:
+                        status = self.skill_executor.get_status(session_id) or "running"
+                        results.append(f"A skill is already running for this session:\n{status}")
+                        continue
+
+                    structured_ran = True
+
+                    async def _run_skill_bg(sk=skill, task=op["task"]):
+                        log.info("background_skill_starting", skill=sk.name, session=session_id)
+                        try:
+                            run = await self.skill_executor.execute(
+                                skill=sk, task_context=task,
+                                subagent_runners=self.subagents,
+                                session_id=session_id, triggered_by=session_id,
+                            )
+                            result_text = self.skill_executor.format_run_result(sk, run)
+                            log.info("background_skill_done", skill=sk.name)
+                            await reply_fn(result_text)
+                            # Store as pending result instead of writing to session
+                            # directly — prevents context contamination when the user
+                            # sends new messages while the skill was running.
+                            self._pending_results.setdefault(session_id, []).append(
+                                f"[Background skill '{sk.name}' completed]\n{result_text}"
+                            )
+                            if run.status == "failed":
+                                failed_step = next(
+                                    (r for r in run.step_results if r.status == "failed"), None,
+                                )
+                                self._record_error(
+                                    "skill_run_failed", run.error,
+                                    skill=sk.name,
+                                    step=failed_step.step_id if failed_step else "",
+                                )
+                                await self._auto_diagnose(
+                                    event="skill_run_failed", error=run.error,
+                                    reply_fn=reply_fn, skill_name=sk.name,
+                                    step_id=failed_step.step_id if failed_step else "",
+                                    step_output=failed_step.output if failed_step else "",
+                                    context=f"Task: {task}\nFull result:\n{result_text[:3000]}",
+                                )
+                        except Exception as e:
+                            err = f"Skill '{sk.name}' failed: {e}"
+                            log.error("background_skill_failed", error=str(e), exc_info=True)
+                            self._record_error("background_skill_crashed", str(e), skill=sk.name)
+                            await reply_fn(err)
+                            self._pending_results.setdefault(session_id, []).append(
+                                f"[Background skill '{sk.name}' FAILED: {e}]"
+                            )
+                            await self._auto_diagnose(
+                                event="background_skill_crashed", error=str(e),
+                                reply_fn=reply_fn, skill_name=sk.name,
+                                context=f"Task: {task}",
+                            )
+                        finally:
+                            self._skill_tasks.pop(session_id, None)
+
+                    bg_task = asyncio.create_task(_run_skill_bg())
+                    self._skill_tasks[session_id] = (bg_task, reply_fn)
+                    results.append(
+                        f"Skill **{skill.name}** is now running in the background "
+                        f"({len(skill.steps)} steps). I'll report results when it finishes."
+                    )
+                else:
+                    extra_delegations.append({
+                        "agent": skill.subagent,
+                        "task": f"Using your skill '{skill.name}', perform the following task: {op['task']}",
+                    })
+                    log.info("skill_execution_triggered", name=skill.name, agent=skill.subagent)
 
             elif op["type"] == "propose":
-                try:
-                    raw_yaml = op["content"]
-                    # Strip markdown code fences if the LLM wrapped the YAML
-                    raw_yaml = re.sub(r"^```(?:yaml)?\n?", "", raw_yaml.strip(), flags=re.IGNORECASE)
-                    raw_yaml = re.sub(r"\n?```$", "", raw_yaml.strip())
-                    # Skip any leading prose and find the start of the YAML list
-                    list_match = re.search(r"^[ \t]*-[ \t]", raw_yaml, re.MULTILINE)
-                    if list_match:
-                        raw_yaml = raw_yaml[list_match.start():]
-                    log.debug("propose_skill_raw_yaml", content=raw_yaml[:500])
-                    steps_data = yaml.safe_load(raw_yaml)
-                    steps = []
-                    if isinstance(steps_data, list):
-                        for sd in steps_data:
-                            steps.append(_dict_to_step(sd))
-
-                    new_skill = Skill(
-                        name=op["name"],
-                        subagent=op["subagent"],
-                        description=op["description"],
-                        steps=steps,
-                        status="proposed",
-                        author="bot",
+                if "sysadmin" in self.subagents:
+                    sysadmin_prompt = (
+                        f"Create a new proposed skill file at _proposed/{op['name']}/SKILL.md\n\n"
+                        f"Skill name: {op['name']}\n"
+                        f"Description: {op['description']}\n"
+                        f"Default subagent: {op['subagent']}\n\n"
+                        f"The orchestrator drafted these steps (improve them if needed):\n"
+                        f"{op['content']}\n\n"
+                        "Read agent source files under ../agent/ if you need to understand "
+                        "what tools or capabilities are available to each subagent. "
+                        "Write the final SKILL.md with proper YAML frontmatter and steps. "
+                        "After writing, read the file back and verify the YAML parses correctly."
                     )
-                    save_proposed_skill(new_skill)
-                    self.skill_registry.reload()
-                    skill_results.append(
-                        f"[Skill System] Proposed new skill: '{op['name']}' with {len(steps)} steps. "
-                        f"Use SKILL APPROVE {op['name']} to activate it."
+                    extra_delegations.append({"agent": "sysadmin", "task": sysadmin_prompt})
+                    results.append(
+                        f"[Skill System] Delegating skill proposal '{op['name']}' to sysadmin..."
                     )
-                except Exception as e:
-                    log.error("propose_skill_parse_failed", error=str(e), raw_yaml=op.get("content", "")[:500])
-                    skill_results.append(f"[Skill System] ERROR proposing skill: {e}")
+                    log.info("propose_skill_delegated", name=op["name"])
+                else:
+                    try:
+                        raw_yaml = op["content"]
+                        raw_yaml = re.sub(r"^```(?:yaml)?\n?", "", raw_yaml.strip(), flags=re.IGNORECASE)
+                        raw_yaml = re.sub(r"\n?```$", "", raw_yaml.strip())
+                        list_match = re.search(r"^[ \t]*-[ \t]", raw_yaml, re.MULTILINE)
+                        if list_match:
+                            raw_yaml = raw_yaml[list_match.start():]
+                        steps_data = yaml.safe_load(raw_yaml)
+                        steps = []
+                        if isinstance(steps_data, list):
+                            for sd in steps_data:
+                                steps.append(_dict_to_step(sd))
+                        new_skill = Skill(
+                            name=op["name"], subagent=op["subagent"],
+                            description=op["description"], steps=steps,
+                            status="proposed", author="bot",
+                        )
+                        save_proposed_skill(new_skill)
+                        self.skill_registry.reload()
+                        results.append(
+                            f"[Skill System] Proposed new skill: '{op['name']}' with {len(steps)} steps. "
+                            f"Use SKILL APPROVE {op['name']} to activate it."
+                        )
+                    except Exception as e:
+                        log.error("propose_skill_parse_failed", error=str(e))
+                        results.append(f"[Skill System] ERROR proposing skill: {e}")
 
-        # ── Delegation ──────────────────────────────────────────────
-        valid_delegations = [d for d in delegations if d["agent"] in self.subagents]
+        return results, extra_delegations, structured_ran
 
-        # --- Fast path: vision/skill work already done, no other delegation ---
-        if (
-            vision_results or skill_results or generated_images
-        ) and not valid_delegations:
-            # If we only generated images with no analysis/errors, send empty text
-            if generated_images and not vision_results and not skill_results:
-                final = ""
-            else:
-                final = "\n\n".join(vision_results + skill_results)
+    async def _execute_delegations(
+        self,
+        delegations: list[dict],
+        user_msg: str,
+        session_id: str,
+    ) -> list[str]:
+        """Run subagent delegations concurrently. Returns formatted results.
 
-            if final:
-                await session.add_message("assistant", final)
-            return make_result(final, generated_images)
+        Subagents that are already busy are skipped with a status message.
+        """
+        results: list[str] = []
+        to_run: list[dict] = []
 
-        if not valid_delegations and not skill_results and not vision_results:
-            # Orchestrator tried to delegate to unknown agents — just return raw
-            final = _strip_thinking(response.content)
-            await session.add_message("assistant", final)
-            return make_result(final)
-
-        # --- We have subagent delegations to run ---
-        if valid_delegations and not structured_skill_ran and not vision_results:
-            agent_names = [d["agent"] for d in valid_delegations]
-            await reply_fn(f"Working on it — delegating to {', '.join(agent_names)}...")
-
-        # Run subagents concurrently
-        tasks = [
-            self.subagents[d["agent"]].run(d["task"], context=user_msg)
-            for d in valid_delegations
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # ── Synthesis decision ──────────────────────────────────────
-        result_parts = list(vision_results) + list(skill_results)
-        for d, result in zip(valid_delegations, results):
-            if isinstance(result, Exception):
-                result_parts.append(
-                    f"[{d['agent']}] ERROR: {type(result).__name__}: {result}"
+        # Guard: skip subagents that are already busy
+        for d in delegations:
+            agent_name = d["agent"]
+            if agent_name in self._active_delegations:
+                busy_info = self._active_delegations[agent_name]
+                results.append(
+                    f"[{agent_name}] BUSY: Currently working on a task "
+                    f"for session {busy_info.get('session_id', '?')[:20]}. "
+                    f"Try again when it's done."
                 )
-                log.error("subagent_failed", agent=d["agent"], error=str(result))
+                log.info("delegation_skipped_busy", agent=agent_name,
+                         busy_session=busy_info.get("session_id"))
             else:
-                result_parts.append(f"[{d['agent']}] Result:\n{result}")
+                to_run.append(d)
 
-        has_errors = any(isinstance(r, Exception) for r in results)
-        needs_synthesis = (
-            len(valid_delegations) > 1
-            or (skill_results and valid_delegations)
-            or (vision_results and valid_delegations)
-            or has_errors
+        if not to_run:
+            return results
+
+        # Mark subagents as busy
+        for d in to_run:
+            self._active_delegations[d["agent"]] = {
+                "session_id": session_id,
+                "task": d["task"][:200],
+            }
+
+        try:
+            tasks = [
+                self.subagents[d["agent"]].run(d["task"], context=user_msg)
+                for d in to_run
+            ]
+            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            # Clear busy state
+            for d in to_run:
+                self._active_delegations.pop(d["agent"], None)
+
+        # Reload skills if sysadmin was involved
+        if any(d["agent"] == "sysadmin" for d in to_run):
+            self.skill_registry.reload()
+            self.skills = self.skill_registry.list_active()
+            log.info("skills_reloaded_after_sysadmin")
+
+        for d, result in zip(to_run, raw_results):
+            if isinstance(result, Exception):
+                results.append(f"[{d['agent']}] ERROR: {type(result).__name__}: {result}")
+                log.error("subagent_failed", agent=d["agent"], error=str(result))
+                self._record_error(
+                    "subagent_failed", str(result),
+                    agent=d["agent"], task=d["task"][:500],
+                    session_id=session_id,
+                )
+            else:
+                results.append(f"[{d['agent']}] Result:\n{result}")
+
+        # Fire-and-forget auto-diagnosis for failures
+        has_errors = any(isinstance(r, Exception) for r in raw_results)
+        if has_errors and "sysadmin" in self.subagents:
+            error_summary = "; ".join(
+                f"{d['agent']}: {r}" for d, r in zip(to_run, raw_results)
+                if isinstance(r, Exception)
+            )
+            await self._auto_diagnose(
+                event="subagent_delegation_failed",
+                error=error_summary,
+                context=f"User message: {user_msg[:500]}",
+            )
+
+        return results
+
+    def _record_error(
+        self,
+        event: str,
+        error: str,
+        **context,
+    ) -> None:
+        """Record an error to the journal."""
+        self.error_journal.record(event, error, context or None)
+
+    async def _auto_diagnose(
+        self,
+        event: str,
+        error: str,
+        reply_fn: Callable[[str], Awaitable[None]] | None = None,
+        skill_name: str = "",
+        step_id: str = "",
+        step_output: str = "",
+        context: str = "",
+    ) -> None:
+        """Fire-and-forget: delegate a diagnosis to sysadmin if available."""
+        if "sysadmin" not in self.subagents:
+            return
+
+        prompt = build_diagnosis_prompt(
+            event=event,
+            error=error,
+            skill_name=skill_name,
+            step_id=step_id,
+            step_output=step_output,
+            context=context,
         )
 
-        if needs_synthesis:
-            synthesis_msg = (
-                "Here are the results from the subagents you delegated to:\n\n"
-                + "\n\n---\n\n".join(result_parts)
-                + "\n\nPlease synthesize these into a clear, final response for the user."
-            )
+        async def _run():
+            try:
+                result = await self.subagents["sysadmin"].run(prompt)
+                log.info("auto_diagnose_complete", event=event, result_len=len(result))
+                if reply_fn:
+                    await reply_fn(
+                        f"**Diagnostic report filed** for `{event}`"
+                        f"{f' (skill: {skill_name})' if skill_name else ''}. "
+                        f"Use `DIAGNOSE` to view reports."
+                    )
+            except Exception as e:
+                log.warning("auto_diagnose_failed", event=event, error=str(e))
 
-            await session.add_message("assistant", response.content)
-            await session.add_message("user", synthesis_msg)
-
-            synth_start = time.monotonic()
-            final_response = await provider.complete(
-                messages=session.get_messages_for_llm(),
-                system=self.get_system_prompt(session_id=session_id),
-                model=model,
-                max_tokens=self.config.orchestrator_max_tokens,
-            )
-            if self.cost_tracker:
-                await self.cost_tracker.log_call(
-                    provider=provider_name,
-                    model=model,
-                    usage=final_response.usage,
-                    session_id=session_id,
-                    agent="orchestrator",
-                    duration_ms=int((time.monotonic() - synth_start) * 1000),
-                )
-
-            final = _strip_thinking(final_response.content)
-        else:
-            # Single clean result — pass through directly
-            if valid_delegations and not isinstance(results[0], Exception):
-                final = results[0]
-            else:
-                final = "\n\n".join(result_parts)
-
-            await session.add_message("assistant", response.content)
-
-        await session.add_message("assistant", final)
-        return make_result(final, generated_images)
+        asyncio.create_task(_run())
 
     def _make_summarizer(self):
         """Create a cheap summarizer function for session compression."""
@@ -613,6 +921,52 @@ def _parse_skill_ops(text: str) -> list[dict]:
     return ops
 
 
+_DELEGATION_COUNTER = 0
+
+
+def _summarize_delegations(delegations: list[dict]) -> str:
+    """Turn delegation dicts into a short, natural status message.
+
+    Speaks as a single voice — no mention of subagents or delegation.
+    Extracts the gist of each task and varies the phrasing so it
+    doesn't feel like a template.
+    """
+    global _DELEGATION_COUNTER
+
+    snippets: list[str] = []
+    for d in delegations:
+        first_line = ""
+        for line in d["task"].strip().splitlines():
+            line = line.strip()
+            if line and not line.startswith(("Using your skill", "##", "```")):
+                first_line = line
+                break
+        if not first_line:
+            first_line = d["task"].strip().splitlines()[0].strip()
+
+        if len(first_line) > 100:
+            first_line = first_line[:97] + "..."
+        # Lowercase so it reads mid-sentence
+        first_line = first_line[0].lower() + first_line[1:] if first_line else "this"
+        snippets.append(first_line)
+
+    joined = "; ".join(snippets) if len(snippets) > 1 else snippets[0]
+
+    # Rotate through varied phrasings so consecutive messages don't sound identical
+    openers = [
+        f"Let me {joined}",
+        f"Looking into this — {joined}",
+        f"Pulling that together now — {joined}",
+        f"Okay, {joined}",
+        f"Sure — {joined}",
+        f"Working on that — {joined}",
+        f"Give me a moment — {joined}",
+    ]
+    msg = openers[_DELEGATION_COUNTER % len(openers)]
+    _DELEGATION_COUNTER += 1
+    return msg
+
+
 def _parse_vision_ops(text: str) -> list[dict]:
     """Extract <analyze_image>, <generate_image>, and <edit_image> blocks."""
     ops = []
@@ -657,3 +1011,38 @@ def _strip_thinking(text: str) -> str:
     )
     text = re.sub(r"<edit_image>.*?</edit_image>", "", text, flags=re.DOTALL)
     return text.strip()
+
+
+def _infer_skill_execution(
+    text: str, registry: "SkillRegistry"
+) -> dict | None:
+    """Detect when the LLM references running a skill without proper XML.
+
+    Returns an execute op dict if a known skill name appears in context
+    that suggests the LLM intended to trigger it, or None.
+    """
+    text_lower = text.lower()
+
+    # Only trigger if the response looks like it's claiming to run something
+    action_phrases = [
+        "running",
+        "executing",
+        "starting",
+        "triggered",
+        "launching",
+        "is now running",
+        "in the background",
+    ]
+    if not any(phrase in text_lower for phrase in action_phrases):
+        return None
+
+    for skill in registry.list_active():
+        if not skill.has_steps:
+            continue
+        # Check skill name appears in the response
+        if skill.name.lower() in text_lower:
+            # Extract any surrounding context as the task
+            task_context = text.strip()
+            return {"type": "execute", "name": skill.name, "task": task_context}
+
+    return None

@@ -50,6 +50,8 @@ class SubagentConfig:
     tools: list[str] = field(default_factory=list)
     max_tokens: int = 4096
     temperature: float = 0.7
+    workspace_dir: str = ""   # override workspace (write boundary); default: workspaces/<name>/
+    read_root: str = ""       # override read boundary; default: workspaces/
 
     @property
     def resolved_provider(self) -> str:
@@ -80,6 +82,10 @@ class Config:
     orchestrator_fallback_model: str = ""
     orchestrator_system_prompt: str = ""
     orchestrator_max_tokens: int = 4096
+
+    # Tiered ingress
+    classify_model: str = ""        # cheap model for classify step; defaults to orchestrator_model
+    synthesis_model: str = ""       # smarter model for multi-agent synthesis; defaults to orchestrator_fallback_model
 
     # Subagents
     subagents: dict[str, SubagentConfig] = field(default_factory=dict)
@@ -131,6 +137,8 @@ def _apply_yaml(cfg: Config, raw: dict):
     cfg.orchestrator_fallback_model = orch.get("fallback", cfg.orchestrator_fallback_model)
     cfg.orchestrator_system_prompt = orch.get("system_prompt", "")
     cfg.orchestrator_max_tokens = orch.get("max_tokens", cfg.orchestrator_max_tokens)
+    cfg.classify_model = orch.get("classify_model", cfg.classify_model)
+    cfg.synthesis_model = orch.get("synthesis_model", cfg.synthesis_model)
 
     # Subagents
     for name, sa_raw in raw.get("subagents", {}).items():
@@ -144,6 +152,8 @@ def _apply_yaml(cfg: Config, raw: dict):
             tools=tools,
             max_tokens=sa_raw.get("max_tokens", 4096),
             temperature=sa_raw.get("temperature", 0.7),
+            workspace_dir=sa_raw.get("workspace_dir", ""),
+            read_root=sa_raw.get("read_root", ""),
         )
 
     # Access control

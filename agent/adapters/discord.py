@@ -147,6 +147,34 @@ class DiscordAdapter(BaseAdapter):
                 log.debug("discord_unknown_user_dropped", user_id=user_id)
                 return
 
+            # ── Fetch recent channel history so the bot sees what was
+            # said before it was mentioned (other bots, other users) ──
+            channel_context = ""
+            if not is_dm:
+                try:
+                    recent: list[discord.Message] = []
+                    async for hist_msg in message.channel.history(
+                        limit=15, before=message
+                    ):
+                        recent.append(hist_msg)
+                    recent.reverse()  # oldest first
+
+                    if recent:
+                        lines = []
+                        for m in recent:
+                            tag = "[BOT]" if m.author.bot else "[USER]"
+                            content = m.content[:500] if m.content else ""
+                            if content:
+                                lines.append(f"{tag} {m.author.display_name}: {content}")
+                        if lines:
+                            channel_context = (
+                                "[Recent channel messages (oldest first):\n"
+                                + "\n".join(lines)
+                                + "\n]\n\n"
+                            )
+                except Exception as e:
+                    log.warning("discord_history_fetch_failed", error=str(e))
+
             system_context = ""
             if message.guild and hasattr(message.channel, "members"):
                 channel_members = []
@@ -164,7 +192,7 @@ class DiscordAdapter(BaseAdapter):
                         + "]"
                     )
 
-            final_text = text + system_context
+            final_text = channel_context + text + system_context
 
             # Extract image attachments
             attachments = []

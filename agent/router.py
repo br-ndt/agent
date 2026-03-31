@@ -55,8 +55,9 @@ class Router:
         upper = raw_text.upper()
 
         if tier == "admin" and (
-            upper in ("RESTART", "HEALME", "STATUS", "COST", "COSTS", "SKILLS")
+            upper in ("RESTART", "HEALME", "STATUS", "COST", "COSTS", "SKILLS", "DIAGNOSE", "ERRORS")
             or upper.startswith("SKILL ")
+            or upper.startswith("DIAGNOSE ")
             or upper == "RELOAD SKILLS"
         ):
             clean_msg = IncomingMessage(
@@ -203,6 +204,29 @@ class Router:
             self.orchestrator.skills = self.orchestrator.skill_registry.list_active()
             count = len(self.orchestrator.skills)
             await adapter.send(msg.chat_id, f"♻️ Reloaded {count} skill(s).")
+        elif cmd == "ERRORS":
+            errors = self.orchestrator.error_journal.recent(20)
+            if not errors:
+                await adapter.send(msg.chat_id, "No recent errors.")
+            else:
+                lines = [f"**Last {len(errors)} errors:**"]
+                for e in errors:
+                    ts = e.get("ts", "?")[:16]
+                    lines.append(f"`{ts}` **{e.get('event', '?')}**: {e.get('error', '?')[:120]}")
+                await adapter.send(msg.chat_id, "\n".join(lines))
+        elif cmd == "DIAGNOSE":
+            summary = self.orchestrator.diagnostic_store.summary()
+            await adapter.send(msg.chat_id, summary)
+        elif cmd.startswith("DIAGNOSE "):
+            filename = msg.text.split(None, 1)[1].strip()
+            report = self.orchestrator.diagnostic_store.read_report(filename)
+            if report:
+                # Truncate for chat
+                if len(report) > 1800:
+                    report = report[:1800] + "\n\n... (truncated)"
+                await adapter.send(msg.chat_id, report)
+            else:
+                await adapter.send(msg.chat_id, f"Report not found: `{filename}`")
         elif cmd.startswith("SKILL "):
             await self._handle_skill_subcommand(msg, adapter)
 
