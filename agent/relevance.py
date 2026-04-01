@@ -17,15 +17,15 @@ log = structlog.get_logger()
 
 RELEVANCE_PROMPT = """You are a message router for a Discord bot named "{bot_name}".
 
-Your ONLY job: decide if the message is ASKING {bot_name} to do something or DIRECTLY talking to {bot_name}.
+Decide if {bot_name} should respond to this message. Respond with exactly one word:
 
-Respond with exactly one word: YES, NO, or WAIT.
-
-- YES: The message directly asks {bot_name} to do something or is addressed to {bot_name}.
-- NO: The message just mentions {bot_name} in passing, is talking ABOUT {bot_name}, is for another bot, or is general chatter. If in doubt, say NO.
+- YES: The message asks {bot_name} to do something, asks {bot_name} a question, or needs {bot_name}'s input.
+- NO: The message mentions {bot_name} in passing, talks ABOUT {bot_name}, thanks {bot_name} without asking anything new, is for another bot, or is general chatter. Acknowledgements like "thanks", "cool", "nice", "got it" are NO unless they include a follow-up question or request.
+- REACT: The message acknowledges {bot_name} or is a simple thanks/approval that deserves a reaction (thumbs up) but not a full reply.
 - WAIT: The message tells {bot_name} to hold off, wait for someone else, or stand by.
 
-IMPORTANT: Talking ABOUT {bot_name} is NOT the same as talking TO {bot_name}. "calne responded" is NO. "calne do this" is YES.
+Key distinction: talking ABOUT {bot_name} is NOT talking TO {bot_name}.
+"calne did a good job" → NO. "calne can you fix this" → YES. "thanks calne" → REACT.
 
 Other bots in this channel: {other_bots}
 
@@ -74,16 +74,12 @@ class RelevanceFilter:
         if is_dm:
             return True, "dm"
 
-        # Fast path: direct @mention with no other bots mentioned — skip LLM
-        if is_mentioned and not self._mentions_other_entity(msg.text):
-            return True, "mentioned"
-
-        # Not mentioned at all and no other ambiguity — skip
+        # Not mentioned at all and name not in text — skip without LLM
         if not is_mentioned and self.bot_name.lower() not in msg.text.lower():
             return False, "skip"
 
-        # Ambiguous: mentioned alongside other bots, or name in text
-        # Use LLM to classify
+        # Everything else goes through the LLM — even direct @mentions,
+        # because "@bot thanks" and "@bot do this" need different handling.
         try:
             other_bots_str = ", ".join(
                 self.other_bot_names.values()
@@ -109,6 +105,10 @@ class RelevanceFilter:
                 log.info("relevance_wait", sender=msg.sender_name,
                          text_preview=msg.text[:80])
                 return True, "wait"
+            elif answer.startswith("REACT"):
+                log.debug("relevance_react", sender=msg.sender_name,
+                          text_preview=msg.text[:80])
+                return True, "react"
             elif answer.startswith("YES"):
                 log.debug("relevance_yes", sender=msg.sender_name)
                 return True, "process"
@@ -119,7 +119,10 @@ class RelevanceFilter:
 
         except Exception as e:
             log.warning("relevance_filter_error", error=str(e))
-            return True, "error_fallback"
+            # On error, fall back to processing if mentioned, skip otherwise
+            if is_mentioned:
+                return True, "error_fallback"
+            return False, "skip"
 
     def _mentions_other_entity(self, text: str) -> bool:
         """Check if the message mentions any other bot by ID."""

@@ -113,6 +113,13 @@ class DiscordAdapter(BaseAdapter):
                 if not relevant:
                     return
 
+                if action == "react":
+                    try:
+                        await message.add_reaction("\U0001f44d")  # thumbs up
+                    except Exception:
+                        pass
+                    return
+
                 if action == "wait":
                     await message.channel.send("Got it, standing by.")
                     return

@@ -95,6 +95,7 @@ class ClaudeCLIProvider(BaseProvider):
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=cwd or self.cwd,
+                limit=1024 * 1024,  # 1MB line buffer — default 64KB is too small for large tool results
             )
 
             # Send prompt to stdin, then close it

@@ -44,6 +44,24 @@ DEFAULT_TIMEOUT = 30
 MAX_OUTPUT_CHARS = 50_000
 
 
+def resolve_case_insensitive(parent: Path, name: str) -> str:
+    """If a directory in `parent` matches `name` case-insensitively, return its actual name.
+
+    Returns the original `name` if no match is found (i.e., it's a genuinely new directory).
+    This prevents git clone, cd, mkdir etc. from creating case-variant duplicates.
+    """
+    if not parent.is_dir():
+        return name
+    name_lower = name.lower()
+    for entry in parent.iterdir():
+        if entry.is_dir() and entry.name.lower() == name_lower:
+            if entry.name != name:
+                log.info("case_insensitive_match",
+                         requested=name, existing=entry.name, parent=str(parent))
+            return entry.name
+    return name
+
+
 class BashTool:
     """Executes shell commands in a sandboxed workspace."""
 
@@ -91,6 +109,67 @@ class BashTool:
 
         return None
 
+    def _fix_case_sensitive_paths(self, command: str) -> str:
+        """Rewrite commands that would create case-variant duplicate directories.
+
+        Handles:
+          - `git clone <url>` (no explicit target) — infers dir name from URL
+          - `git clone <url> <target>` — checks target against existing dirs
+          - `cd <dir>` — resolves to existing case-insensitive match
+          - `mkdir <dir>` / `mkdir -p <dir>` — resolves to existing match
+        """
+        import re
+        import shlex
+
+        stripped = command.strip()
+
+        # git clone <url> [target]
+        clone_match = re.match(
+            r'(git\s+clone\s+(?:--[^\s]+\s+)*)'  # git clone [flags]
+            r'(\S+)'                                # url
+            r'(\s+(\S+))?'                          # optional target dir
+            r'(.*)',                                 # trailing flags
+            stripped,
+        )
+        if clone_match:
+            prefix, url, _, explicit_target, suffix = clone_match.groups()
+            if explicit_target:
+                fixed = resolve_case_insensitive(self.workspace, explicit_target)
+                if fixed != explicit_target:
+                    return f"{prefix}{url} {fixed}{suffix}"
+            else:
+                # Infer directory name from URL (what git would create)
+                repo_name = url.rstrip("/").rsplit("/", 1)[-1]
+                repo_name = re.sub(r"\.git$", "", repo_name)
+                fixed = resolve_case_insensitive(self.workspace, repo_name)
+                if fixed != repo_name:
+                    return f"{prefix}{url} {fixed}{suffix}"
+            return command
+
+        # cd <dir>
+        cd_match = re.match(r'cd\s+("?)(\S+)\1\s*(&&|;|\||$)', stripped)
+        if cd_match:
+            quote, dirname, rest_sep = cd_match.groups()
+            fixed = resolve_case_insensitive(self.workspace, dirname)
+            if fixed != dirname:
+                remainder = stripped[cd_match.end():]
+                return f'cd {quote}{fixed}{quote} {rest_sep} {remainder}'.rstrip()
+            return command
+
+        # mkdir [-p] <dir>
+        mkdir_match = re.match(r'(mkdir\s+(?:-p\s+)?)(\S+)(.*)', stripped)
+        if mkdir_match:
+            prefix, dirname, suffix = mkdir_match.groups()
+            # Resolve the first path component case-insensitively
+            parts = Path(dirname).parts
+            if parts:
+                fixed_first = resolve_case_insensitive(self.workspace, parts[0])
+                if fixed_first != parts[0]:
+                    fixed_path = str(Path(fixed_first, *parts[1:]))
+                    return f"{prefix}{fixed_path}{suffix}"
+
+        return command
+
     async def execute(self, command: str) -> dict:
         """Execute a command and return {stdout, stderr, exit_code, error}."""
         # Check if command is allowed
@@ -103,6 +182,9 @@ class BashTool:
                 "exit_code": -1,
                 "error": violation,
             }
+
+        # Prevent case-variant directory duplicates
+        command = self._fix_case_sensitive_paths(command)
 
         log.info("bash_executing",
                  command=command[:100],
@@ -118,14 +200,17 @@ class BashTool:
             }
 
             if self.allow_git:
+                from agent.subagent_runner import _get_agent_gitconfig, _agent_git_identity
+                name, email = _agent_git_identity()
                 home = os.path.expanduser("~")
                 env.update({
                     "HOME": home,  # git/gh need real HOME for SSH + config
-                    "GIT_AUTHOR_NAME": "agent-entro",
-                    "GIT_AUTHOR_EMAIL": "agent-entro@users.noreply.github.com",
-                    "GIT_COMMITTER_NAME": "agent-entro",
-                    "GIT_COMMITTER_EMAIL": "agent-entro@users.noreply.github.com",
-                    "GIT_SSH_COMMAND": "ssh -i ~/.ssh/id_clawdnet_bot -o StrictHostKeyChecking=no",
+                    "GIT_AUTHOR_NAME": name,
+                    "GIT_AUTHOR_EMAIL": email,
+                    "GIT_COMMITTER_NAME": name,
+                    "GIT_COMMITTER_EMAIL": email,
+                    "GIT_CONFIG_GLOBAL": str(_get_agent_gitconfig()),
+                    "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", ""),
                     "GH_CONFIG_DIR": os.path.join(home, ".config", "gh"),
                 })
 

@@ -114,10 +114,8 @@ class Orchestrator:
         self.error_journal = ErrorJournal()
         self.diagnostic_store = DiagnosticStore()
 
-        # Summarizer: uses cheapest available model
-        self._summarizer = self._make_summarizer()
 
-    def get_system_prompt(self, session_id: str = "", prompt_tier: str = "full") -> str:
+    def get_system_prompt(self, session_id: str = "", prompt_tier: str = "full", memory_index: str = "") -> str:
         """Dynamically build the system prompt with current subagents and skills.
 
         prompt_tier controls how much context is included:
@@ -129,11 +127,18 @@ class Orchestrator:
             return (
                 "Classify this message into one category:\n"
                 "- SIMPLE: greetings, small talk, factual questions, math, formatting, "
-                "simple opinions, short answers\n"
-                "- DELEGATE: needs code, research, web access, file ops, image work, "
-                "or matches a known skill\n"
+                "simple opinions, short answers, questions ABOUT skills or capabilities, "
+                "status checks, acknowledgements, or anything you can answer conversationally "
+                "without running code or fetching external data\n"
+                "- DELEGATE: the user is asking you to DO something that requires tools — "
+                "write/edit code, execute a skill, fetch a web page, read/write files, "
+                "generate images, or run commands. The key word is DO, not ASK ABOUT.\n"
                 "- COMPLEX: nuanced analysis, architecture, multi-step reasoning, "
-                "debate, detailed explanations, synthesis of multiple topics\n\n"
+                "debate, detailed explanations, synthesis of multiple topics — but still "
+                "answerable conversationally without tools\n\n"
+                "IMPORTANT: Questions about how something works, what skills exist, "
+                "or explaining a concept are SIMPLE or COMPLEX, not DELEGATE. "
+                "DELEGATE is only for requests that require tool execution.\n\n"
                 "Reply with ONLY the category name, nothing else."
             )
 
@@ -173,22 +178,8 @@ class Orchestrator:
             return result
 
         # ── Full tier: skills, vision, learning, proposing ──────────
-        # Memory index injection
-        memory_block = ""
-        if self.memory_store and session_id:
-            import asyncio
-
-            try:
-                loop = asyncio.get_event_loop()
-                pointers = loop.run_until_complete(
-                    self.memory_store.get_index(session_id)
-                )
-                global_pointers = loop.run_until_complete(
-                    self.memory_store.get_global_index()
-                )
-                memory_block = build_memory_index_prompt(pointers, global_pointers)
-            except RuntimeError:
-                pass  # Not in async context, skip
+        # Memory index is pre-fetched in the async handle() path and passed in
+        memory_block = memory_index
         skill_catalog = self.skill_registry.build_catalog()
 
         vision_instructions = ""
@@ -258,7 +249,9 @@ class Orchestrator:
             "<delegate agent=\"sysadmin\">Fix the skill 'skill-name': describe the problem and any error output</delegate>\n\n"
             "The sysadmin can read agent source code and edit skill files directly.\n\n"
             f"## Available Skills\n{skill_catalog}\n\n"
-            f"{vision_instructions}" + prompt
+            f"{vision_instructions}"
+            + (f"\n{memory_block}\n\n" if memory_block else "")
+            + prompt
         )
 
         # Inject live skill status if one is running for this session
@@ -331,7 +324,6 @@ class Orchestrator:
             session = PersistentSession(
                 session_id=session_id,
                 store=self.session_store,
-                summarizer=self._summarizer,
                 memory_store=self.memory_store,
             )
             self.sessions[session_id] = session
@@ -547,7 +539,13 @@ class Orchestrator:
 
             if valid_delegations:
                 if not notified_delegation and not structured_skill_ran:
-                    await reply_fn(_summarize_delegations(valid_delegations))
+                    # Use the LLM's own preamble text as the status message —
+                    # it's more natural than rebuilding from the task text.
+                    preamble = _extract_preamble(response.content)
+                    if preamble:
+                        await reply_fn(preamble)
+                    else:
+                        await reply_fn(_summarize_delegations(valid_delegations))
                     notified_delegation = True
 
                 d_results = await self._execute_delegations(
@@ -1087,30 +1085,6 @@ class Orchestrator:
 
         asyncio.create_task(_run())
 
-    def _make_summarizer(self):
-        """Create a cheap summarizer function for session compression."""
-        summarize_provider = self.providers.get("google", self.provider)
-        summarize_model = (
-            "gemini-2.5-flash"
-            if "google" in self.providers
-            else self.config.orchestrator_model
-        )
-
-        async def summarize(text: str) -> str:
-            response = await summarize_provider.complete(
-                messages=[{"role": "user", "content": text}],
-                system=(
-                    "Summarize this conversation in 2-3 concise sentences. "
-                    "Capture key topics, decisions made, and any pending tasks. "
-                    "Do not include greetings or filler."
-                ),
-                model=summarize_model,
-                max_tokens=300,
-                temperature=0.3,
-            )
-            return response.content
-
-        return summarize
 
 
 def _parse_delegations(text: str) -> list[dict]:
@@ -1156,6 +1130,34 @@ def _parse_skill_ops(text: str) -> list[dict]:
 
 
 _DELEGATION_COUNTER = 0
+
+
+def _extract_preamble(response_content: str) -> str:
+    """Extract the LLM's conversational text before any operation tags.
+
+    When the orchestrator responds with something like:
+        "Sure, I'll look into the sync issues and fix them.
+         <delegate agent="coder">...</delegate>"
+
+    This extracts "Sure, I'll look into the sync issues and fix them."
+    Returns empty string if there's no meaningful preamble.
+    """
+    # Find the first operation tag
+    tag_pattern = r"<(?:delegate|execute_skill|learn_skill|propose_skill|analyze_image|generate_image|edit_image|recall|remember)\s"
+    match = re.search(tag_pattern, response_content)
+    if not match:
+        return ""
+
+    preamble = response_content[: match.start()].strip()
+
+    # Strip thinking tags if present
+    preamble = re.sub(r"<thinking>.*?</thinking>", "", preamble, flags=re.DOTALL).strip()
+
+    # Too short to be useful (e.g. just "OK" or empty)
+    if len(preamble) < 10:
+        return ""
+
+    return preamble
 
 
 def _summarize_delegations(delegations: list[dict]) -> str:

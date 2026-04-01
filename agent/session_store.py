@@ -1,12 +1,13 @@
-"""Session persistence with rolling summarization.
+"""Session persistence with pointer-based memory.
 
 Two-tier memory:
   1. Hot buffer: last N messages in-memory (what the LLM sees directly)
-  2. Cold summary: a compact paragraph summarizing everything older
+  2. Memory topics: structured topic entries in the MemoryStore, surfaced
+     via the lightweight pointer index in the orchestrator's system prompt
 
-When history exceeds MAX_HOT messages, the oldest chunk gets summarized
-and appended to the running summary. On restart, sessions reload with
-just the summary + last few messages — not the entire conversation.
+When history exceeds MAX_HOT messages, the oldest chunk is written to the
+MemoryStore as a searchable topic. The orchestrator fetches detail on
+demand via <recall> — no flat summary is injected into the message list.
 
 Storage: SQLite (one row per session). Lightweight, no extra services.
 """
@@ -14,7 +15,6 @@ Storage: SQLite (one row per session). Lightweight, no extra services.
 import json
 import time
 from pathlib import Path
-from typing import Callable
 
 import aiosqlite
 import structlog
@@ -143,15 +143,12 @@ class PersistentSession:
         self,
         session_id: str,
         store: SessionStore,
-        summarizer: Callable | None = None,
         memory_store=None,
     ):
         self.session_id = session_id
         self.store = store
-        self.summarizer = summarizer  # async fn(messages) -> str
-        self.memory_store = memory_store  # for embedding-based retrieval
+        self.memory_store = memory_store
 
-        self.summary: str = ""
         self.history: list[dict] = []
         self.message_count: int = 0
         self._loaded = False
@@ -165,7 +162,6 @@ class PersistentSession:
         if self._loaded:
             return
         data = await self.store.load(self.session_id)
-        self.summary = data["summary"]
         self.history = data["history"]
         self.message_count = data["message_count"]
         self._loaded = True
@@ -173,93 +169,53 @@ class PersistentSession:
     def get_messages_for_llm(self) -> list[dict]:
         """Build the message list the LLM actually sees.
 
-        If there's a summary, it goes in as the first user message
-        so the LLM has context without the full history.
+        Context from older messages is handled by the memory index
+        in the system prompt, not by injecting a summary here.
         """
-        messages = []
-
-        if self.summary:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"[Previous conversation summary: {self.summary}]\n\n"
-                        "Continue from where we left off."
-                    ),
-                }
-            )
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": "Understood, I have the context from our previous conversation. How can I help?",
-                }
-            )
-
-        messages.extend(self.history)
-        return messages
+        return list(self.history)
 
     async def add_message(self, role: str, content: str):
-        """Add a message and trigger summarization if needed."""
+        """Add a message and write old messages to memory if buffer is full."""
         self.history.append({"role": role, "content": content})
         self.message_count += 1
 
-        # Summarize old messages if buffer is too large
-        if len(self.history) > MAX_HOT and self.summarizer:
-            await self._summarize_oldest()
+        # Evict oldest messages into memory topics when buffer overflows
+        if len(self.history) > MAX_HOT and self.memory_store:
+            await self._evict_to_memory()
 
         # Auto-save
         await self.store.save(
-            self.session_id, self.summary, self.history, self.message_count
+            self.session_id, "", self.history, self.message_count
         )
 
-    async def _summarize_oldest(self):
-        """Summarize the oldest messages and fold into the running summary."""
-        to_summarize = self.history[:SUMMARIZE_CHUNK]
+    async def _evict_to_memory(self):
+        """Write the oldest messages to the MemoryStore as a topic, then drop them."""
+        to_evict = self.history[:SUMMARIZE_CHUNK]
         self.history = self.history[SUMMARIZE_CHUNK:]
 
-        # Build text to summarize
-        parts = []
-        if self.summary:
-            parts.append(f"Previous summary: {self.summary}")
-        parts.append("New messages to incorporate:")
-        for msg in to_summarize:
-            parts.append(f"  {msg['role']}: {msg['content'][:500]}")
-
-        text = "\n".join(parts)
-
         try:
-            self.summary = await self.summarizer(text)
-            log.info(
-                "session_summarized",
+            from agent.memory import build_topic_summary_for_index
+            topic, summary, content = build_topic_summary_for_index(
+                to_evict, topic_hint=""
+            )
+            await self.memory_store.save_topic(
                 session_id=self.session_id,
-                summarized_messages=len(to_summarize),
-                summary_len=len(self.summary),
+                topic=topic,
+                summary=summary,
+                content=content,
+            )
+            log.info(
+                "session_evicted_to_memory",
+                session_id=self.session_id,
+                evicted_messages=len(to_evict),
+                topic=topic,
             )
         except Exception as e:
-            log.error("session_summarize_failed", error=str(e))
-            # On failure, just truncate without summary
-            pass
-
-        # Also save as a structured memory topic
-        if self.memory_store:
-            try:
-                from agent.memory import build_topic_summary_for_index
-                topic, summary, content = build_topic_summary_for_index(
-                    to_summarize, topic_hint=""
-                )
-                await self.memory_store.save_topic(
-                    session_id=self.session_id,
-                    topic=topic,
-                    summary=summary,
-                    content=content,
-                )
-            except Exception as e:
-                log.warning("memory_topic_save_failed", error=str(e))
+            log.warning("memory_eviction_failed", error=str(e))
 
 
     async def clear(self):
         """Reset the session."""
-        self.summary = ""
         self.history = []
         self.message_count = 0
         await self.store.delete(self.session_id)

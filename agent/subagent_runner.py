@@ -11,6 +11,7 @@ uniform interface regardless of provider.
 """
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -29,6 +30,38 @@ log = structlog.get_logger()
 MAX_TURNS = 15
 BASE_DIR = Path(__file__).resolve().parent.parent
 WORKSPACES_DIR = BASE_DIR / "workspaces"
+
+
+def _agent_git_identity() -> tuple[str, str]:
+    """Return (name, email) for the agent's git identity.
+
+    Reads from GIT_AGENT_NAME / GIT_AGENT_EMAIL env vars.
+    Falls back to the system git config if unset.
+    """
+    import subprocess
+
+    name = os.environ.get("GIT_AGENT_NAME", "")
+    email = os.environ.get("GIT_AGENT_EMAIL", "")
+
+    if not name:
+        try:
+            name = subprocess.run(
+                ["git", "config", "--global", "user.name"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except Exception:
+            name = "agent"
+
+    if not email:
+        try:
+            email = subprocess.run(
+                ["git", "config", "--global", "user.email"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except Exception:
+            email = "agent@localhost"
+
+    return name, email
 
 # Maps SubagentConfig tool names → Claude Code native tool names
 NATIVE_TOOL_MAP: dict[str, list[str]] = {
@@ -171,13 +204,14 @@ class SubagentRunner:
         # Pass git identity env if git tools are enabled
         extra_env = {}
         if "git" in self.config.tools:
-            import os
+            name, email = _agent_git_identity()
             extra_env = {
-                "GIT_AUTHOR_NAME": "agent-entro",
-                "GIT_AUTHOR_EMAIL": "agent-entro@users.noreply.github.com",
-                "GIT_COMMITTER_NAME": "agent-entro",
-                "GIT_COMMITTER_EMAIL": "agent-entro@users.noreply.github.com",
-                "GIT_SSH_COMMAND": "ssh -i ~/.ssh/id_clawdnet_bot -o StrictHostKeyChecking=no",
+                "GIT_AUTHOR_NAME": name,
+                "GIT_AUTHOR_EMAIL": email,
+                "GIT_COMMITTER_NAME": name,
+                "GIT_COMMITTER_EMAIL": email,
+                "GIT_CONFIG_GLOBAL": str(_get_agent_gitconfig()),
+                "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", ""),
                 "GH_CONFIG_DIR": os.path.join(os.path.expanduser("~"), ".config", "gh"),
             }
 
@@ -385,33 +419,53 @@ class SubagentRunner:
 # ── Workspace helpers ─────────────────────────────────────────
 
 
+def _get_agent_gitconfig() -> Path:
+    """Return path to a shared gitconfig file for agent identity.
+
+    This file is pointed to by GIT_CONFIG_GLOBAL in the subagent env,
+    ensuring all git operations (including those spawned by Claude Code's
+    internal Bash tool, which doesn't propagate env vars) use the agent
+    identity regardless of when repos are cloned or initialized.
+
+    Regenerated each call so env var changes take effect without restart.
+    """
+    name, email = _agent_git_identity()
+    config_path = BASE_DIR / "state" / "agent-gitconfig"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        f"[user]\n"
+        f"    name = {name}\n"
+        f"    email = {email}\n"
+    )
+    return config_path
+
+
 def _ensure_git_identity(workspace: Path):
     """Set repo-local git identity in any git repo under the workspace.
 
     Claude Code doesn't propagate env vars to its Bash tool subprocesses,
-    so GIT_AUTHOR_NAME etc. get lost. Repo-local config is authoritative.
+    so GIT_AUTHOR_NAME etc. get lost. We set repo-local config as a
+    belt-and-suspenders measure alongside GIT_CONFIG_GLOBAL.
     """
     import subprocess
 
-    # Find git repos: workspace itself or immediate child dirs
-    candidates = [workspace]
-    candidates.extend(d for d in workspace.iterdir() if d.is_dir() and (d / ".git").exists())
+    name, email = _agent_git_identity()
 
-    for repo in candidates:
-        if not (repo / ".git").exists():
-            continue
+    # Find git repos: workspace itself and any depth below
+    for repo in workspace.rglob(".git"):
+        repo_dir = repo.parent
         try:
             subprocess.run(
-                ["git", "config", "user.name", "agent-entro"],
-                cwd=str(repo), check=True, capture_output=True,
+                ["git", "config", "user.name", name],
+                cwd=str(repo_dir), check=True, capture_output=True,
             )
             subprocess.run(
-                ["git", "config", "user.email", "agent-entro@users.noreply.github.com"],
-                cwd=str(repo), check=True, capture_output=True,
+                ["git", "config", "user.email", email],
+                cwd=str(repo_dir), check=True, capture_output=True,
             )
-            log.debug("git_identity_set", repo=str(repo))
+            log.debug("git_identity_set", repo=str(repo_dir))
         except Exception as e:
-            log.warning("git_identity_failed", repo=str(repo), error=str(e))
+            log.warning("git_identity_failed", repo=str(repo_dir), error=str(e))
 
 
 def _link_sibling_workspaces(workspace: Path, workspaces_dir: Path, self_name: str):

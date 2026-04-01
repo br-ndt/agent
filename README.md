@@ -113,9 +113,19 @@ subagents:
 
 Every provider call goes through retry logic with exponential backoff, automatic fallback to alternate providers, and a circuit breaker that skips broken providers for 60 seconds. If Claude's auth expires overnight, your Discord bot keeps working on Gemini Flash.
 
-## Session persistence
+## Session persistence and memory
 
-Conversations persist to SQLite with rolling summarization. Recent messages stay in full detail; older messages get summarized into a compact paragraph by the cheapest available model. Sessions survive restarts.
+Conversations persist to SQLite. The last 40 messages stay in the hot buffer as full detail; when the buffer overflows, old messages are evicted into a **pointer-based memory system** (`agent/memory.py`). A lightweight index of topic pointers is always loaded into the orchestrator's system prompt. Full topic content is stored separately in SQLite and fetched on demand via `<recall>` / `<remember>` XML ops. No flat summary is injected into the message list — the memory index handles long-term context without unbounded token growth.
+
+## Security and trust model
+
+The delegation pipeline treats every subagent as an untrusted node:
+
+- **Output sanitizer** (`agent/sanitizer.py`) — Strips orchestrator control tags, flags prompt injection patterns, and redacts leaked API keys from subagent output before the orchestrator sees it.
+- **State ledger** (`agent/state_ledger.py`) — Tracks ground-truth file checksums and validates subagent claims ("I wrote foo.py") against disk. False claims are flagged in the result.
+- **Persona enforcement** (`agent/persona_enforcement.py`) — Injects hard identity anchors and role-specific negative constraints into subagent prompts. Post-checks output for violations like unauthorized delegation attempts or system prompt disclosure.
+
+See `CONTEXT.md` for architectural rationale.
 
 ## Running as a daemon
 
@@ -167,6 +177,10 @@ agent/
 │   ├── subagent_runner.py     # Runs tasks against any provider/model
 │   ├── personas.py            # Loads personality markdown files
 │   ├── session_store.py       # Persistent sessions with summarization
+│   ├── memory.py              # Pointer-based long-term memory (SQLite)
+│   ├── state_ledger.py        # Ground-truth state tracking and validation
+│   ├── sanitizer.py           # Zero-trust output filter for subagents
+│   ├── persona_enforcement.py # Strict identity constraints per role
 │   ├── providers/
 │   │   ├── base.py            # Abstract provider interface
 │   │   ├── anthropic.py       # Claude via API (pay-per-token)
@@ -184,9 +198,19 @@ agent/
 ├── scripts/                   # Helper scripts
 ├── state/                     # Runtime state — sessions, logs (gitignored)
 ├── systemd/                   # Systemd service file
+├── tests/                     # Unit and integration tests (pytest)
 ├── config.yaml                # Agent and subagent configuration
 ├── .env.example               # API key template
 ├── bootstrap.sh               # Server setup script
 ├── test_connection.py         # Provider connectivity test
+├── CONTEXT.md                 # Architectural rationale
 └── pyproject.toml             # Python dependencies
 ```
+
+## Tests
+
+```bash
+uv run pytest tests/ -v
+```
+
+Tests cover the four security/memory modules and their integration through the delegation pipeline. The integration tests in `test_delegation_pipeline.py` mock subagent runners and exercise the full sanitizer -> ledger -> persona chain against real SQLite databases.
