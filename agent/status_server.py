@@ -275,6 +275,24 @@ def _gather_stats() -> dict:
     # Adapters
     if _router:
         stats["adapters"] = list(_router.adapters.keys())
+        stats["quiet"] = bool(getattr(_router, "_quiet", False))
+        quiet_since = getattr(_router, "_quiet_since", None)
+        if stats["quiet"] and quiet_since is not None:
+            elapsed = int(time.monotonic() - quiet_since)
+            days, rem = divmod(elapsed, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes, secs = divmod(rem, 60)
+            parts = []
+            if days:
+                parts.append(f"{days}d")
+            if hours:
+                parts.append(f"{hours}h")
+            if minutes:
+                parts.append(f"{minutes}m")
+            parts.append(f"{secs}s")
+            stats["quiet_duration"] = " ".join(parts)
+        else:
+            stats["quiet_duration"] = None
 
     # Providers (with health check results)
     if _providers:
@@ -546,6 +564,15 @@ async def handle_index(request):
     overall_class = "error" if any_unhealthy else "ok"
     overall_text = "DEGRADED" if any_unhealthy else "HEALTHY"
 
+    is_quiet = stats.get("quiet", False)
+    quiet_duration = stats.get("quiet_duration")
+    if is_quiet and quiet_duration:
+        quiet_badge = f' <span class="overall error">QUIET ({quiet_duration})</span>'
+    elif is_quiet:
+        quiet_badge = ' <span class="overall error">QUIET</span>'
+    else:
+        quiet_badge = ""
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -758,7 +785,7 @@ async def handle_index(request):
 <div class="header">
   <h1>Agent Dashboard</h1>
   <span class="uptime">up {stats['uptime']}</span>
-  <span class="overall {overall_class}">{overall_text}</span>
+  <span class="overall {overall_class}">{overall_text}</span>{quiet_badge}
 </div>
 
 <div class="stats-row">
@@ -848,11 +875,14 @@ async def handle_health(request):
 
     any_unhealthy = any(s != "ok" for s in provider_health.values())
 
+    is_quiet = bool(_router and getattr(_router, "_quiet", False))
+
     return web.json_response(
         {
             "status": "degraded" if any_unhealthy else "ok",
             "uptime_seconds": int(time.time() - _start_time),
             "providers": provider_health,
+            "quiet": is_quiet,
         }
     )
 

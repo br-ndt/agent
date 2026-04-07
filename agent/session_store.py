@@ -189,7 +189,7 @@ class PersistentSession:
         )
 
     async def _evict_to_memory(self):
-        """Write the oldest messages to the MemoryStore as a topic, then drop them."""
+        """Write the oldest messages to the MemoryStore, merging into related topics when possible."""
         to_evict = self.history[:SUMMARIZE_CHUNK]
         self.history = self.history[SUMMARIZE_CHUNK:]
 
@@ -198,18 +198,35 @@ class PersistentSession:
             topic, summary, content = build_topic_summary_for_index(
                 to_evict, topic_hint=""
             )
-            await self.memory_store.save_topic(
-                session_id=self.session_id,
-                topic=topic,
-                summary=summary,
-                content=content,
+
+            # Try to merge into an existing related topic instead of creating a new one
+            related = await self.memory_store.find_related_topic(
+                self.session_id, topic, content
             )
-            log.info(
-                "session_evicted_to_memory",
-                session_id=self.session_id,
-                evicted_messages=len(to_evict),
-                topic=topic,
-            )
+
+            if related:
+                await self.memory_store.merge_into_topic(
+                    self.session_id, related, content, summary
+                )
+                log.info(
+                    "session_evicted_merged",
+                    session_id=self.session_id,
+                    evicted_messages=len(to_evict),
+                    merged_into=related,
+                )
+            else:
+                await self.memory_store.save_topic(
+                    session_id=self.session_id,
+                    topic=topic,
+                    summary=summary,
+                    content=content,
+                )
+                log.info(
+                    "session_evicted_new_topic",
+                    session_id=self.session_id,
+                    evicted_messages=len(to_evict),
+                    topic=topic,
+                )
         except Exception as e:
             log.warning("memory_eviction_failed", error=str(e))
 

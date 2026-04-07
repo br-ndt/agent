@@ -1,5 +1,8 @@
 """Router — access control tiers and message dispatch."""
 
+import asyncio
+import time
+
 import structlog
 
 from agent.adapters.base import IncomingMessage, BaseAdapter
@@ -14,6 +17,11 @@ class Router:
         self.config = config
         self.orchestrator = orchestrator
         self.adapters: dict[str, BaseAdapter] = {}
+
+        # Global quiet mode — all adapters respect this
+        self._quiet = False
+        self._quiet_since: float | None = None  # time.monotonic() when enabled
+        self._quiet_lock = asyncio.Lock()
 
     def register_adapter(self, name: str, adapter: BaseAdapter):
         self.adapters[name] = adapter
@@ -55,9 +63,11 @@ class Router:
         upper = raw_text.upper()
 
         if tier == "admin" and (
-            upper in ("RESTART", "HEALME", "STATUS", "COST", "COSTS", "SKILLS", "DIAGNOSE", "ERRORS")
+            upper in ("RESTART", "HEALME", "STATUS", "COST", "COSTS", "SKILLS", "DIAGNOSE", "ERRORS", "QUIET", "WAKE")
             or upper.startswith("SKILL ")
             or upper.startswith("DIAGNOSE ")
+            or upper.startswith("CANCEL ")
+            or upper == "CANCEL"
             or upper == "RELOAD SKILLS"
         ):
             clean_msg = IncomingMessage(
@@ -70,6 +80,21 @@ class Router:
             )
             await self._handle_admin_command(clean_msg)
             return
+
+        # Quiet mode — block non-admin messages before any LLM work.
+        # CLI always bypasses (local admin). Admin commands already returned above.
+        if msg.platform != "cli" and tier != "admin":
+            async with self._quiet_lock:
+                quiet_now = self._quiet
+            if quiet_now:
+                adapter = self.adapters.get(msg.platform)
+                if adapter:
+                    await adapter.send(
+                        msg.chat_id,
+                        "I'm currently in quiet mode. An admin can wake me with `WAKE`.",
+                    )
+                log.info("quiet_mode_rejected", sender=msg.sender_name, platform=msg.platform)
+                return
 
         # Get the adapter for replies
         adapter = self.adapters.get(msg.platform)
@@ -148,11 +173,45 @@ class Router:
 
         cmd = msg.text.split("[System Context:")[0].strip().upper()
         if cmd == "STATUS":
-            session_count = len(self.orchestrator.sessions)
-            await adapter.send(
-                msg.chat_id,
-                f"Status: running\nActive sessions: {session_count}",
-            )
+            lines = [f"**Status**: running"]
+            # Show quiet mode state
+            if self._quiet and self._quiet_since is not None:
+                elapsed = int(time.monotonic() - self._quiet_since)
+                days, rem = divmod(elapsed, 86400)
+                hours, rem = divmod(rem, 3600)
+                minutes, secs = divmod(rem, 60)
+                parts = []
+                if days:
+                    parts.append(f"{days}d")
+                if hours:
+                    parts.append(f"{hours}h")
+                if minutes:
+                    parts.append(f"{minutes}m")
+                parts.append(f"{secs}s")
+                lines.append(f"**Mode**: QUIET for {' '.join(parts)} (only WAKE from admins)")
+            lines.append(f"**Sessions**: {len(self.orchestrator.sessions)}")
+
+            # Active delegations
+            if self.orchestrator._active_delegations:
+                lines.append("\n**Active delegations**:")
+                for agent, info in self.orchestrator._active_delegations.items():
+                    started = info.get("started_at", 0)
+                    elapsed = f"{int(time.time() - started)}s" if started else "?"
+                    task = info.get("task", "?")[:100]
+                    lines.append(f"  `{agent}` ({elapsed}): {task}")
+            else:
+                lines.append("**Active delegations**: none")
+
+            # Background skill tasks
+            if self.orchestrator._skill_tasks:
+                lines.append("\n**Background skills**:")
+                for sid, (task, _) in self.orchestrator._skill_tasks.items():
+                    status = self.orchestrator.skill_executor.get_status(sid)
+                    lines.append(f"  session `{sid[:12]}...`: {status or 'running'}")
+            else:
+                lines.append("**Background skills**: none")
+
+            await adapter.send(msg.chat_id, "\n".join(lines))
         elif cmd == "HEALME":
             for s in self.orchestrator.sessions.values():
                 await s.clear()
@@ -227,6 +286,69 @@ class Router:
                 await adapter.send(msg.chat_id, report)
             else:
                 await adapter.send(msg.chat_id, f"Report not found: `{filename}`")
+        elif cmd == "CANCEL" or cmd.startswith("CANCEL "):
+            parts = msg.text.strip().split(maxsplit=1)
+            if len(parts) < 2:
+                # CANCEL with no args — show what can be cancelled
+                lines = []
+                if self.orchestrator._active_delegations:
+                    lines.append("**Active delegations** (use `CANCEL <agent>`):")
+                    for agent in self.orchestrator._active_delegations:
+                        lines.append(f"  `{agent}`")
+                if self.orchestrator._skill_tasks:
+                    lines.append("**Background skills** (use `CANCEL SKILL <session>`):")
+                    for sid in self.orchestrator._skill_tasks:
+                        lines.append(f"  `{sid[:20]}`")
+                if not lines:
+                    lines.append("Nothing running to cancel.")
+                await adapter.send(msg.chat_id, "\n".join(lines))
+            else:
+                target = parts[1].strip().lower()
+
+                # Cancel a delegation by agent name
+                if target in self.orchestrator._active_delegations:
+                    self.orchestrator._active_delegations.pop(target)
+                    await adapter.send(msg.chat_id, f"Cleared `{target}` from active delegations.")
+                # Cancel all delegations
+                elif target == "all":
+                    count = len(self.orchestrator._active_delegations)
+                    self.orchestrator._active_delegations.clear()
+                    # Also cancel background skills
+                    for sid, (task, _) in list(self.orchestrator._skill_tasks.items()):
+                        task.cancel()
+                    self.orchestrator._skill_tasks.clear()
+                    await adapter.send(msg.chat_id, f"Cancelled {count} delegation(s) and all background skills.")
+                # Cancel a background skill by session prefix
+                elif target.startswith("skill"):
+                    skill_parts = parts[1].strip().split(maxsplit=1)
+                    if len(skill_parts) > 1:
+                        prefix = skill_parts[1].strip()
+                        cancelled = False
+                        for sid, (task, _) in list(self.orchestrator._skill_tasks.items()):
+                            if sid.startswith(prefix):
+                                task.cancel()
+                                self.orchestrator._skill_tasks.pop(sid, None)
+                                await adapter.send(msg.chat_id, f"Cancelled background skill for session `{sid[:20]}`.")
+                                cancelled = True
+                                break
+                        if not cancelled:
+                            await adapter.send(msg.chat_id, f"No background skill matching `{prefix}`.")
+                    else:
+                        await adapter.send(msg.chat_id, "Usage: `CANCEL SKILL <session_prefix>`")
+                else:
+                    await adapter.send(msg.chat_id, f"Nothing found for `{target}`. Use `CANCEL` to see options.")
+        elif cmd == "QUIET":
+            async with self._quiet_lock:
+                self._quiet = True
+                self._quiet_since = time.monotonic()
+            await adapter.send(msg.chat_id, "Going quiet. Only `WAKE` from admins will be heard.")
+            log.info("quiet_mode_enabled", by=msg.sender_id)
+        elif cmd == "WAKE":
+            async with self._quiet_lock:
+                self._quiet = False
+                self._quiet_since = None
+            await adapter.send(msg.chat_id, "Back online. Listening to all messages.")
+            log.info("quiet_mode_disabled", by=msg.sender_id)
         elif cmd.startswith("SKILL "):
             await self._handle_skill_subcommand(msg, adapter)
 

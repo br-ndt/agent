@@ -136,6 +136,93 @@ class TestMemorySearch:
         assert results == []
 
 
+class TestMergeOnEvict:
+    """Related topics should be merged instead of creating duplicates."""
+
+    @pytest.mark.asyncio
+    async def test_find_related_topic_by_content_overlap(self, memory_store: MemoryStore):
+        await memory_store.save_topic(
+            "s1", "neondrift-multiplayer",
+            "NeonDrift multiplayer sync issues",
+            "The NeonDrift multiplayer system has desync issues with remote car positions "
+            "and interpolation timing. Players report ghost cars teleporting.",
+        )
+        related = await memory_store.find_related_topic(
+            "s1", "neondrift-desync",
+            "Fixed the NeonDrift multiplayer desync by correcting delta baseline. "
+            "Remote car interpolation now uses server tick alignment.",
+        )
+        assert related == "neondrift-multiplayer"
+
+    @pytest.mark.asyncio
+    async def test_no_related_topic_for_unrelated_content(self, memory_store: MemoryStore):
+        await memory_store.save_topic(
+            "s1", "auth-redesign", "Auth migration to JWT", "JWT token rotation and migration plan"
+        )
+        related = await memory_store.find_related_topic(
+            "s1", "deploy-pipeline",
+            "Setting up the deploy pipeline with Docker and systemd service files.",
+        )
+        assert related is None
+
+    @pytest.mark.asyncio
+    async def test_merge_appends_content(self, memory_store: MemoryStore):
+        await memory_store.save_topic(
+            "s1", "project-notes", "Project setup notes", "Initial project setup with SQLite."
+        )
+        await memory_store.merge_into_topic(
+            "s1", "project-notes",
+            "Added Redis caching layer.",
+            "Project notes updated with caching",
+        )
+        topic = await memory_store.get_topic("s1", "project-notes")
+        assert "Initial project setup" in topic.content
+        assert "Redis caching" in topic.content
+
+    @pytest.mark.asyncio
+    async def test_merge_caps_content_size(self, memory_store: MemoryStore):
+        await memory_store.save_topic(
+            "s1", "big-topic", "Big topic", "x" * 9000
+        )
+        await memory_store.merge_into_topic(
+            "s1", "big-topic", "y" * 5000, "More content"
+        )
+        topic = await memory_store.get_topic("s1", "big-topic")
+        assert len(topic.content) <= 10000
+
+    @pytest.mark.asyncio
+    async def test_index_stays_compact_with_merging(self, memory_store: MemoryStore):
+        """Multiple evictions about the same topic should merge, not create N entries."""
+        await memory_store.save_topic(
+            "s1", "neondrift-work",
+            "NeonDrift game development",
+            "Working on the NeonDrift racing game multiplayer features.",
+        )
+        # Simulate multiple evictions about the same topic
+        for i in range(5):
+            related = await memory_store.find_related_topic(
+                "s1", f"neondrift-chunk-{i}",
+                f"More NeonDrift multiplayer work: fixing issue number {i} "
+                "with racing game interpolation and server sync.",
+            )
+            if related:
+                await memory_store.merge_into_topic(
+                    "s1", related,
+                    f"Fixed NeonDrift issue {i}",
+                    f"NeonDrift fix {i}",
+                )
+            else:
+                await memory_store.save_topic(
+                    "s1", f"neondrift-chunk-{i}",
+                    f"NeonDrift fix {i}",
+                    f"Fixed NeonDrift issue {i}",
+                )
+
+        index = await memory_store.get_index("s1")
+        # Should have merged into the original, not created 5 new entries
+        assert len(index) <= 2  # original + at most 1 if first didn't match
+
+
 class TestBuildMemoryIndexPrompt:
     """The prompt builder must produce a parseable, bounded index."""
 

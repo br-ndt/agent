@@ -63,6 +63,11 @@ ROLE_NEGATIVES: dict[str, list[str]] = {
         "Never delete active skills without explicit admin approval.",
         "Always verify YAML parses correctly after editing skill files.",
     ],
+    "playwright": [
+        "Never write application code beyond throwaway scripts for web interaction.",
+        "Never modify project source files — you only interact with websites.",
+        "Always report what you observe on the page before taking actions.",
+    ],
     "ops": [
         "Never modify application source code — only deployment and infrastructure.",
         "Never run destructive commands without confirming the target.",
@@ -200,5 +205,6 @@ def _infer_role_summary(agent_name: str, system_prompt: str) -> str:
         "sysadmin": "Maintain skill definitions and system configuration.",
         "ops": "Handle deployment, infrastructure, and system administration.",
         "fast_helper": "Quick tasks: summarization, formatting, simple Q&A.",
+        "playwright": "Interact with websites using Playwright — play games, fill forms, click buttons, navigate UIs.",
     }
     return summaries.get(agent_name, f"Specialized agent: {agent_name}")

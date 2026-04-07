@@ -16,6 +16,66 @@ from agent.relevance import RelevanceFilter
 
 log = structlog.get_logger()
 
+MAX_LEN = 2000
+
+
+def _split_message(text: str, limit: int = MAX_LEN) -> list[str]:
+    """Split text into chunks that respect Discord's character limit.
+
+    Tries to break at, in order: paragraph boundaries (blank lines),
+    line boundaries, then word boundaries. Preserves open code fences
+    across chunks so markdown rendering isn't broken.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        # Find the best split point within the limit
+        window = remaining[:limit]
+        split_at = -1
+
+        # Prefer blank-line break (paragraph boundary)
+        pos = window.rfind("\n\n")
+        if pos > limit // 4:
+            split_at = pos + 1  # keep one newline on current chunk
+
+        # Fall back to any newline
+        if split_at == -1:
+            pos = window.rfind("\n")
+            if pos > limit // 4:
+                split_at = pos + 1
+
+        # Fall back to a space
+        if split_at == -1:
+            pos = window.rfind(" ")
+            if pos > limit // 4:
+                split_at = pos + 1
+
+        # Last resort: hard cut
+        if split_at == -1:
+            split_at = limit
+
+        chunk = remaining[:split_at]
+        remaining = remaining[split_at:]
+
+        # If we split inside an unclosed code fence, close it on this
+        # chunk and re-open it on the next so both render correctly.
+        fence_count = chunk.count("```")
+        if fence_count % 2 == 1:
+            chunk += "\n```"
+            remaining = "```\n" + remaining
+
+        chunks.append(chunk)
+
+    return chunks
+
 
 class DiscordAdapter(BaseAdapter):
     def __init__(
@@ -41,6 +101,8 @@ class DiscordAdapter(BaseAdapter):
         self.client = discord.Client(intents=intents)
         self._on_message = None
         self._ready = asyncio.Event()
+
+        self._admin_ids: set[str] = set()  # populated from router
 
     async def start(self, on_message):
         self._on_message = on_message
@@ -96,6 +158,17 @@ class DiscordAdapter(BaseAdapter):
                     is_role_mentioned = True
                     log.info("bot_role_pinged")
 
+            log.info(
+                "discord_message_pre_filter",
+                sender=message.author.display_name,
+                sender_id=str(message.author.id),
+                is_bot=message.author.bot,
+                is_dm=is_dm,
+                is_mentioned=is_mentioned,
+                is_role_mentioned=is_role_mentioned,
+                text_preview=message.content[:100],
+            )
+
             # Relevance filter
             if self._relevance_filter:
                 relevant, action = await self._relevance_filter.is_relevant(
@@ -114,10 +187,15 @@ class DiscordAdapter(BaseAdapter):
                     return
 
                 if action == "react":
+                    emoji = await self._pick_reaction(message.content)
                     try:
-                        await message.add_reaction("\U0001f44d")  # thumbs up
-                    except Exception:
-                        pass
+                        await message.add_reaction(emoji)
+                        log.info("discord_reacted", emoji=emoji, sender=message.author.display_name)
+                    except discord.Forbidden:
+                        log.error("discord_react_forbidden",
+                                  hint="Bot lacks 'Add Reactions' permission in this channel")
+                    except discord.HTTPException as e:
+                        log.error("discord_react_failed", error=str(e), emoji=emoji)
                     return
 
                 if action == "wait":
@@ -150,7 +228,17 @@ class DiscordAdapter(BaseAdapter):
             user_id = str(message.author.id)
             composite_id = f"discord:{user_id}"
 
-            if self.allowed_ids and composite_id not in self.allowed_ids:
+            # Allow known bots from other_bots config to pass access control
+            is_known_bot = False
+            if self.other_bots:
+                known_bot_ids = set()
+                if isinstance(self.other_bots, dict):
+                    known_bot_ids = {k.split(":", 1)[-1] for k in self.other_bots}
+                elif isinstance(self.other_bots, list):
+                    known_bot_ids = {str(b).split(":", 1)[-1] for b in self.other_bots}
+                is_known_bot = user_id in known_bot_ids
+
+            if self.allowed_ids and composite_id not in self.allowed_ids and not is_known_bot:
                 log.debug("discord_unknown_user_dropped", user_id=user_id)
                 return
 
@@ -254,14 +342,39 @@ class DiscordAdapter(BaseAdapter):
 
         await self.client.start(self.token)
 
+    async def _pick_reaction(self, text: str) -> str:
+        """Use a cheap LLM call to pick an appropriate emoji reaction."""
+        if not self.relevance_provider:
+            return "\U0001f44d"  # thumbs up fallback
+
+        try:
+            response = await self.relevance_provider.complete(
+                messages=[{"role": "user", "content": text[:300]}],
+                system=(
+                    "Pick ONE emoji that best reacts to this message. "
+                    "Reply with ONLY the emoji, nothing else. "
+                    "Examples: \U0001f44d \U0001f525 \u2764\ufe0f \U0001f60e \U0001f389 \U0001f914 \U0001f4af \u2705 \U0001f64f \U0001f440"
+                ),
+                model=self.relevance_model,
+                max_tokens=5,
+                temperature=0.7,
+            )
+            emoji = response.content.strip()
+            # Validate it's actually a short emoji-like string
+            if emoji and len(emoji) <= 8:
+                return emoji
+        except Exception as e:
+            log.debug("react_emoji_pick_failed", error=str(e))
+
+        return "\U0001f44d"
+
     async def send(self, chat_id: str, text: str):
         log.debug("discord_send_attempt", chat_id=chat_id, text_len=len(text))
         try:
             channel = self.client.get_channel(int(chat_id))
             if not channel:
                 channel = await self.client.fetch_channel(int(chat_id))
-            for i in range(0, len(text), 1900):
-                chunk = text[i : i + 1900]
+            for chunk in _split_message(text):
                 await channel.send(chunk)
             log.info("discord_message_sent", chat_id=chat_id)
         except Exception as e:

@@ -317,6 +317,115 @@ class MemoryStore:
             global_=global_,
         )
 
+    async def find_related_topic(
+        self, session_id: str, topic: str, content: str, threshold: float = 0.3
+    ) -> str | None:
+        """Find an existing topic that's related enough to merge into.
+
+        Uses keyword overlap between the new content and existing topic
+        summaries/names. Returns the topic name to merge into, or None.
+
+        threshold: minimum fraction of new content words found in existing topic.
+        """
+        if not self._db:
+            return None
+
+        pointers = await self.get_index(session_id)
+        if not pointers:
+            return None
+
+        # Extract significant words from new content (skip short/common words)
+        new_words = set(
+            w.lower() for w in content.split()
+            if len(w) > 3 and w.isalpha()
+        )
+        if not new_words:
+            return None
+
+        best_match = None
+        best_score = 0.0
+
+        for p in pointers:
+            if p.topic == topic:
+                continue  # don't match self
+
+            # Build word set from existing topic name + summary
+            existing_words = set(
+                w.lower() for w in f"{p.topic} {p.summary}".replace("-", " ").split()
+                if len(w) > 3 and w.isalpha()
+            )
+
+            # Also check the stored content for better matching
+            existing_topic = await self.get_topic(session_id, p.topic)
+            if existing_topic:
+                existing_words.update(
+                    w.lower() for w in existing_topic.content.split()
+                    if len(w) > 3 and w.isalpha()
+                )
+
+            if not existing_words:
+                continue
+
+            overlap = new_words & existing_words
+            score = len(overlap) / len(new_words)
+
+            if score > best_score:
+                best_score = score
+                best_match = p.topic
+
+        if best_score >= threshold:
+            log.info(
+                "memory_merge_candidate",
+                session_id=session_id,
+                new_topic=topic,
+                merge_into=best_match,
+                score=f"{best_score:.2f}",
+            )
+            return best_match
+
+        return None
+
+    async def merge_into_topic(
+        self, session_id: str, target_topic: str, new_content: str, new_summary: str
+    ):
+        """Append new content to an existing topic and update its summary."""
+        if not self._db:
+            return
+
+        existing = await self.get_topic(session_id, target_topic)
+        if not existing:
+            return
+
+        # Append with a separator, cap total size
+        merged = existing.content + f"\n\n---\n\n{new_content}"
+        if len(merged) > 10000:
+            # Keep the most recent content, trim from the front
+            merged = "..." + merged[-(10000 - 3):]
+
+        now = time.time()
+        await self._db.execute(
+            """UPDATE memory_topics SET content = ?, updated_at = ?
+               WHERE session_id = ? AND topic = ?""",
+            (merged, now, session_id, target_topic),
+        )
+
+        # Update the summary to reflect the merged content
+        updated_summary = f"{new_summary[:70]} (+ earlier context)"
+        await self._db.execute(
+            """UPDATE memory_index SET summary = ?, last_accessed = ?
+               WHERE session_id = ? AND topic = ?""",
+            (updated_summary[:MAX_POINTER_LEN], now, session_id, target_topic),
+        )
+        await self._db.commit()
+
+        log.info(
+            "memory_topic_merged",
+            session_id=session_id,
+            target=target_topic,
+            new_content_len=len(new_content),
+            merged_len=len(merged),
+        )
+
     async def search_topics(
         self, session_id: str, query: str, limit: int = 5
     ) -> list[MemoryPointer]:

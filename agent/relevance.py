@@ -74,16 +74,25 @@ class RelevanceFilter:
         if is_dm:
             return True, "dm"
 
+        # Fast path: direct @mention with no other bots mentioned — always process.
+        # This guarantees the bot responds when explicitly addressed.
+        if is_mentioned and not self._mentions_other_entity(msg.text):
+            return True, "mentioned"
+
         # Not mentioned at all and name not in text — skip without LLM
         if not is_mentioned and self.bot_name.lower() not in msg.text.lower():
             return False, "skip"
 
-        # Everything else goes through the LLM — even direct @mentions,
-        # because "@bot thanks" and "@bot do this" need different handling.
+        # Ambiguous: name in text but not @mentioned, or multiple bots mentioned.
+        # Use LLM to decide.
         try:
-            other_bots_str = ", ".join(
-                self.other_bot_names.values()
-            ) if self.other_bot_names else "unknown"
+            if isinstance(self.other_bot_names, dict):
+                other_bots_str = ", ".join(self.other_bot_names.values())
+            elif isinstance(self.other_bot_names, list):
+                other_bots_str = ", ".join(str(b) for b in self.other_bot_names)
+            else:
+                other_bots_str = "unknown"
+            other_bots_str = other_bots_str or "unknown"
 
             prompt = RELEVANCE_PROMPT.format(
                 bot_name=self.bot_name,
@@ -126,7 +135,15 @@ class RelevanceFilter:
 
     def _mentions_other_entity(self, text: str) -> bool:
         """Check if the message mentions any other bot by ID."""
-        for bot_id in self.other_bot_names:
+        ids = []
+        if isinstance(self.other_bot_names, dict):
+            ids = list(self.other_bot_names.keys())
+        elif isinstance(self.other_bot_names, list):
+            ids = self.other_bot_names
+
+        for entry in ids:
+            # Strip platform prefix if present (e.g. "discord:123" -> "123")
+            bot_id = entry.split(":", 1)[-1] if ":" in str(entry) else str(entry)
             if f"<@{bot_id}>" in text or f"<@!{bot_id}>" in text:
                 return True
         return False

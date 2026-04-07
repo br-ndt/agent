@@ -11,6 +11,7 @@ from agent.adapters import cli as cli_adapter, discord as discord_adapter
 
 from agent.config import load_config, infer_provider
 from agent.cost_tracker import CostTracker
+from agent.knowledge import KnowledgeStore
 from agent.memory import MemoryStore
 from agent.orchestrator import Orchestrator
 from agent.personas import load_personas, apply_persona
@@ -154,6 +155,11 @@ async def main():
             using=next(iter(providers.keys())),
         )
 
+    # ── Build knowledge store ────────────────────────────────
+    knowledge_store = KnowledgeStore()
+    knowledge_store.load()
+    log.info("knowledge_store_ready", docs=len(knowledge_store.list_all()))
+
     orchestrator = Orchestrator(
         provider=orch_provider,
         config=cfg,
@@ -165,6 +171,7 @@ async def main():
         vision_provider=vision_provider,
         memory_store=memory_store,
         state_ledger=state_ledger,
+        knowledge_store=knowledge_store,
     )
 
     # ── Build router ──────────────────────────────────────────
@@ -175,9 +182,9 @@ async def main():
     status_runner = await start_status_server(port=cfg.status_port)
 
     # ── Start adapters ────────────────────────────────────────
-    adapter_tasks = []
 
     # Discord adapter (if token provided)
+    discord_bot = None
     if cfg.discord_bot_token:
         # Use cheapest provider for relevance filtering
         relevance_provider = providers.get("google", next(iter(providers.values())))
@@ -190,11 +197,12 @@ async def main():
             relevance_model="gemini-2.5-flash",
             other_bots=cfg.other_bots,
         )
+        discord_bot._admin_ids = cfg.admin_ids
         router.register_adapter("discord", discord_bot)
-        adapter_tasks.append(discord_bot.start(router.handle_message))
         log.info("discord_adapter_enabled")
 
     # Telegram adapter (if token provided)
+    telegram = None
     if cfg.telegram_bot_token:
         from agent.adapters.telegram import TelegramAdapter
 
@@ -203,7 +211,6 @@ async def main():
             allowed_ids=cfg.admin_ids | cfg.trusted_ids or None,
         )
         router.register_adapter("telegram", telegram)
-        adapter_tasks.append(telegram.start(router.handle_message))
         log.info("telegram_adapter_enabled")
 
     # Check for --no-cli flag (daemon mode)
@@ -213,9 +220,40 @@ async def main():
         cli = cli_adapter.CLIAdapter()
         router.register_adapter("cli", cli)
 
-    # Start background adapters
-    for task in adapter_tasks:
-        asyncio.create_task(task)
+    # Start background adapters with supervision — auto-restart on crash
+    async def _supervise_adapter(name: str, start_coro_fn):
+        """Run an adapter, restarting it if it crashes unexpectedly."""
+        restart_delay = 5
+        while True:
+            try:
+                log.info("adapter_supervisor_starting", adapter=name)
+                await start_coro_fn()
+                # Normal exit (e.g. shutdown) — don't restart
+                log.info("adapter_supervisor_exited", adapter=name)
+                return
+            except asyncio.CancelledError:
+                log.info("adapter_supervisor_cancelled", adapter=name)
+                return
+            except Exception as e:
+                log.error(
+                    "adapter_crashed_restarting",
+                    adapter=name,
+                    error=str(e),
+                    restart_in=restart_delay,
+                    exc_info=True,
+                )
+                await asyncio.sleep(restart_delay)
+                restart_delay = min(restart_delay * 2, 120)
+
+    if cfg.discord_bot_token:
+        asyncio.create_task(
+            _supervise_adapter("discord", lambda: discord_bot.start(router.handle_message))
+        )
+
+    if cfg.telegram_bot_token:
+        asyncio.create_task(
+            _supervise_adapter("telegram", lambda: telegram.start(router.handle_message))
+        )
 
     log.info(
         "agent_ready",

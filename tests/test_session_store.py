@@ -149,6 +149,37 @@ class TestMemoryEviction:
         assert found, "Evicted message content not found in any memory topic"
 
 
+class TestMergeOnEvict:
+    """Evictions about the same topic should merge instead of creating duplicates."""
+
+    @pytest.mark.asyncio
+    async def test_repeated_evictions_merge(self, session_store, memory_store):
+        """Talking about the same thing across many messages should produce few topics."""
+        # Seed a topic so there's something to merge into
+        await memory_store.save_topic(
+            "s1", "neondrift-racing",
+            "NeonDrift racing game discussion",
+            "Discussing the NeonDrift multiplayer racing game features and bugs.",
+        )
+
+        session = PersistentSession("s1", session_store, memory_store=memory_store)
+        await session.ensure_loaded()
+
+        # Fill with messages about the same topic to trigger multiple evictions
+        for i in range(MAX_HOT + SUMMARIZE_CHUNK + 5):
+            role = "user" if i % 2 == 0 else "assistant"
+            await session.add_message(
+                role,
+                f"NeonDrift multiplayer racing game: working on sync issue {i}. "
+                "The interpolation and server tick need alignment for ghost cars.",
+            )
+
+        index = await memory_store.get_index("s1")
+        # With merging, we should have far fewer topics than eviction cycles
+        # (without merging, each eviction creates a new topic)
+        assert len(index) <= 3
+
+
 class TestSessionClear:
     """clear() must reset state."""
 

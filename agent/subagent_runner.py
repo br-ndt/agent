@@ -10,6 +10,7 @@ Both paths write to the same per-subagent workspace, so callers see a
 uniform interface regardless of provider.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -32,33 +33,43 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 WORKSPACES_DIR = BASE_DIR / "workspaces"
 
 
-def _agent_git_identity() -> tuple[str, str]:
+async def _agent_git_identity() -> tuple[str, str]:
     """Return (name, email) for the agent's git identity.
 
     Reads from GIT_AGENT_NAME / GIT_AGENT_EMAIL env vars.
     Falls back to the system git config if unset.
     """
-    import subprocess
-
     name = os.environ.get("GIT_AGENT_NAME", "")
     email = os.environ.get("GIT_AGENT_EMAIL", "")
 
     if not name:
         try:
-            name = subprocess.run(
-                ["git", "config", "--global", "user.name"],
-                capture_output=True, text=True, check=True,
-            ).stdout.strip()
+            proc = await asyncio.create_subprocess_exec(
+                "git", "config", "--global", "user.name",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                name = stdout.decode().strip()
         except Exception:
+            pass
+        if not name:
             name = "agent"
 
     if not email:
         try:
-            email = subprocess.run(
-                ["git", "config", "--global", "user.email"],
-                capture_output=True, text=True, check=True,
-            ).stdout.strip()
+            proc = await asyncio.create_subprocess_exec(
+                "git", "config", "--global", "user.email",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                email = stdout.decode().strip()
         except Exception:
+            pass
+        if not email:
             email = "agent@localhost"
 
     return name, email
@@ -68,7 +79,7 @@ NATIVE_TOOL_MAP: dict[str, list[str]] = {
     "bash": ["Bash"],
     "file_ops": ["Read", "Write", "Edit", "Glob", "Grep", "ListDir"],
     "web_fetch": ["WebFetch"],
-    "web_browser": ["WebFetch"],  # Claude doesn't have a browser; WebFetch is closest
+    "web_browser": ["WebFetch", "WebSearch"],
     "git": ["Bash"],  # git/gh commands run via Bash
 }
 
@@ -125,7 +136,7 @@ class SubagentRunner:
                 workspace = WORKSPACES_DIR / self.config.name
             workspace.mkdir(parents=True, exist_ok=True)
             if "git" in self.config.tools:
-                _ensure_git_identity(workspace)
+                await _ensure_git_identity(workspace)
 
         log.info(
             "subagent_starting",
@@ -204,16 +215,25 @@ class SubagentRunner:
         # Pass git identity env if git tools are enabled
         extra_env = {}
         if "git" in self.config.tools:
-            name, email = _agent_git_identity()
+            name, email = await _agent_git_identity()
             extra_env = {
                 "GIT_AUTHOR_NAME": name,
                 "GIT_AUTHOR_EMAIL": email,
                 "GIT_COMMITTER_NAME": name,
                 "GIT_COMMITTER_EMAIL": email,
-                "GIT_CONFIG_GLOBAL": str(_get_agent_gitconfig()),
+                "GIT_CONFIG_GLOBAL": str(await _get_agent_gitconfig()),
                 "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", ""),
                 "GH_CONFIG_DIR": os.path.join(os.path.expanduser("~"), ".config", "gh"),
             }
+            # Claude Code's Bash tool doesn't propagate env vars, so
+            # instruct the agent to set repo-local identity after git init.
+            workspace_hint += (
+                f"\nGit identity: ALWAYS run these commands immediately after "
+                f"any `git init` and before any commits:\n"
+                f"  git config user.name \"{name}\"\n"
+                f"  git config user.email \"{email}\"\n"
+                f"Never use the system git identity.\n"
+            )
 
         start = time.monotonic()
         response = await provider.complete(
@@ -419,7 +439,7 @@ class SubagentRunner:
 # ── Workspace helpers ─────────────────────────────────────────
 
 
-def _get_agent_gitconfig() -> Path:
+async def _get_agent_gitconfig() -> Path:
     """Return path to a shared gitconfig file for agent identity.
 
     This file is pointed to by GIT_CONFIG_GLOBAL in the subagent env,
@@ -429,7 +449,7 @@ def _get_agent_gitconfig() -> Path:
 
     Regenerated each call so env var changes take effect without restart.
     """
-    name, email = _agent_git_identity()
+    name, email = await _agent_git_identity()
     config_path = BASE_DIR / "state" / "agent-gitconfig"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
@@ -440,29 +460,27 @@ def _get_agent_gitconfig() -> Path:
     return config_path
 
 
-def _ensure_git_identity(workspace: Path):
+async def _ensure_git_identity(workspace: Path):
     """Set repo-local git identity in any git repo under the workspace.
 
     Claude Code doesn't propagate env vars to its Bash tool subprocesses,
     so GIT_AUTHOR_NAME etc. get lost. We set repo-local config as a
     belt-and-suspenders measure alongside GIT_CONFIG_GLOBAL.
     """
-    import subprocess
-
-    name, email = _agent_git_identity()
+    name, email = await _agent_git_identity()
 
     # Find git repos: workspace itself and any depth below
     for repo in workspace.rglob(".git"):
         repo_dir = repo.parent
         try:
-            subprocess.run(
-                ["git", "config", "user.name", name],
-                cwd=str(repo_dir), check=True, capture_output=True,
-            )
-            subprocess.run(
-                ["git", "config", "user.email", email],
-                cwd=str(repo_dir), check=True, capture_output=True,
-            )
+            for key, val in [("user.name", name), ("user.email", email)]:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "config", key, val,
+                    cwd=str(repo_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
             log.debug("git_identity_set", repo=str(repo_dir))
         except Exception as e:
             log.warning("git_identity_failed", repo=str(repo_dir), error=str(e))

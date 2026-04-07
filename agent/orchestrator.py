@@ -12,6 +12,7 @@ import structlog
 from agent.config import Config, infer_provider
 from agent.cost_tracker import CostTracker
 from agent.diagnostics import ErrorJournal, DiagnosticStore, build_diagnosis_prompt
+from agent.knowledge import KnowledgeStore, KnowledgeDoc
 from agent.memory import MemoryStore, build_memory_index_prompt
 from agent.providers.base import BaseProvider
 from agent.providers.vision import VisionProvider
@@ -78,6 +79,7 @@ class Orchestrator:
         vision_provider: VisionProvider | None = None,
         memory_store: MemoryStore | None = None,
         state_ledger: StateLedger | None = None,
+        knowledge_store: KnowledgeStore | None = None,
     ):
         self.provider = provider
         self.providers = providers or {}
@@ -87,6 +89,8 @@ class Orchestrator:
         self.vision_provider = vision_provider
         self.memory_store = memory_store
         self.state_ledger = state_ledger
+        self.knowledge_store = knowledge_store or KnowledgeStore()
+        self.knowledge_store.load()
 
         self.sessions: dict[str, PersistentSession] = {}
         self.session_store = session_store
@@ -144,6 +148,18 @@ class Orchestrator:
 
         agent_list = ", ".join(self.subagents.keys()) if self.subagents else "none"
 
+        # Build a routing guide so the orchestrator knows what each agent does
+        agent_descriptions = []
+        for name, runner in self.subagents.items():
+            # Extract first sentence of personality as a short description
+            personality = runner.config.personality.strip()
+            first_line = personality.split("\n")[0].strip()
+            if len(first_line) > 120:
+                first_line = first_line[:117] + "..."
+            tools = ", ".join(runner.config.tools) if runner.config.tools else "none"
+            agent_descriptions.append(f"- **{name}** [{tools}]: {first_line}")
+        agent_guide = "\n".join(agent_descriptions)
+
         prompt = self.config.orchestrator_system_prompt.replace(
             "{subagent_list}", agent_list
         )
@@ -165,6 +181,11 @@ class Orchestrator:
             "When a subagent like 'researcher' reports the content of a page, do not summarize "
             "it too heavily if the user's intent was to see what's on the page. "
             "Provide a thorough report of the actual contents found.\n\n"
+            "## Web Task Routing\n"
+            "- READ a page / research something → delegate to **researcher**\n"
+            "- REVIEW a PR or code on the web → delegate to **reviewer**\n"
+            "- INTERACT with a website (play a game, fill forms, click buttons, "
+            "use a web app) → delegate to **playwright**\n\n"
         )
 
         if prompt_tier == "minimal":
@@ -172,7 +193,7 @@ class Orchestrator:
             base += (
                 "When a task requires delegation, emit:\n"
                 '<delegate agent="agent_name">task description</delegate>\n\n'
-                f"Available subagents: {agent_list}\n\n"
+                f"## Subagent Routing Guide\n{agent_guide}\n\n"
             )
             result = base + prompt
             return result
@@ -200,7 +221,8 @@ class Orchestrator:
             )
 
         result = (
-            base + "## Skill System\n"
+            base + f"## Subagent Routing Guide\n{agent_guide}\n\n"
+            "## Skill System\n"
             "You can learn and execute skills.\n\n"
             "### Executing a skill\n"
             "When a user's request matches a known skill (check triggers below), delegate using:\n"
@@ -251,7 +273,8 @@ class Orchestrator:
             f"## Available Skills\n{skill_catalog}\n\n"
             f"{vision_instructions}"
             + (f"\n{memory_block}\n\n" if memory_block else "")
-            + prompt
+            + self.knowledge_store.build_index_prompt()
+            + "\n\n" + prompt
         )
 
         # Inject live skill status if one is running for this session
@@ -267,10 +290,14 @@ class Orchestrator:
 
         # Inject busy subagent status
         if self._active_delegations:
+            import time as _time
             busy_lines = []
             for agent_name, info in self._active_delegations.items():
+                started = info.get("started_at", 0)
+                elapsed = int(_time.time() - started) if started else 0
+                elapsed_str = f"{elapsed}s ago" if elapsed < 60 else f"{elapsed // 60}m ago"
                 busy_lines.append(
-                    f"- **{agent_name}**: working on: {info.get('task', '?')[:100]}"
+                    f"- **{agent_name}** (started {elapsed_str}): {info.get('task', '?')[:100]}"
                 )
             result += (
                 "\n\n## Busy Subagents\n"
@@ -485,6 +512,7 @@ class Orchestrator:
             skill_ops = _parse_skill_ops(response.content)
             vision_ops = _parse_vision_ops(response.content)
             memory_ops = _parse_memory_ops(response.content)
+            knowledge_ops = _parse_knowledge_ops(response.content)
 
             # Infer skill execution if LLM forgot XML
             if not (session_id in self._skill_tasks) and not any(
@@ -496,7 +524,7 @@ class Orchestrator:
                     log.warning("skill_execution_inferred", skill=inferred["name"])
                     skill_ops.append(inferred)
 
-            has_ops = bool(delegations or skill_ops or vision_ops or memory_ops)
+            has_ops = bool(delegations or skill_ops or vision_ops or memory_ops or knowledge_ops)
 
             if not has_ops:
                 # No operations — this is the final response
@@ -529,6 +557,11 @@ class Orchestrator:
             if memory_ops and self.memory_store:
                 m_results = await self._execute_memory_ops(memory_ops, session_id)
                 pass_results.extend(m_results)
+
+            # Knowledge
+            if knowledge_ops:
+                k_results = self._execute_knowledge_ops(knowledge_ops)
+                pass_results.extend(k_results)
 
             delegations.extend(s_delegations)
             if s_structured:
@@ -930,6 +963,30 @@ class Orchestrator:
 
         return results, extra_delegations, structured_ran
 
+    def _execute_knowledge_ops(self, ops: list[dict]) -> list[str]:
+        """Execute <learn> operations — save knowledge docs to disk."""
+        results = []
+        for op in ops:
+            try:
+                doc = KnowledgeDoc(
+                    slug=op["slug"],
+                    title=op["title"],
+                    tags=op["tags"],
+                    agents=op["agents"],
+                    url=op.get("url", ""),
+                    content=op["content"],
+                )
+                path = self.knowledge_store.save(doc)
+                results.append(
+                    f"[Knowledge] Saved '{op['title']}' as {op['slug']}.md "
+                    f"(tags: {', '.join(op['tags'])})"
+                )
+                log.info("knowledge_learned", slug=op["slug"], path=str(path))
+            except Exception as e:
+                results.append(f"[Knowledge] ERROR saving '{op['slug']}': {e}")
+                log.error("knowledge_learn_failed", slug=op["slug"], error=str(e))
+        return results
+
     async def _execute_delegations(
         self,
         delegations: list[dict],
@@ -969,7 +1026,22 @@ class Orchestrator:
             self._active_delegations[d["agent"]] = {
                 "session_id": session_id,
                 "task": d["task"][:200],
+                "started_at": time.time(),
             }
+
+        # Inject relevant knowledge into each delegation task
+        for d in to_run:
+            docs = self.knowledge_store.find_for_task(
+                d["task"], agent=d["agent"]
+            )
+            if docs:
+                knowledge_ctx = self.knowledge_store.build_knowledge_context(docs)
+                d["task"] = knowledge_ctx + "\n\n" + d["task"]
+                log.info(
+                    "knowledge_injected",
+                    agent=d["agent"],
+                    docs=[doc.slug for doc in docs],
+                )
 
         try:
             tasks = [
@@ -1088,8 +1160,8 @@ class Orchestrator:
 
 
 def _parse_delegations(text: str) -> list[dict]:
-    """Extract <delegate agent="name">task</delegate> blocks."""
-    pattern = r'<delegate\s+agent="(\w+)">(.*?)</delegate>'
+    """Extract <delegate agent="name" ...>task</delegate> blocks."""
+    pattern = r'<delegate\s+agent="(\w+)"[^>]*>(.*?)</delegate>'
     matches = re.findall(pattern, text, re.DOTALL)
     return [{"agent": agent, "task": task.strip()} for agent, task in matches]
 
@@ -1143,7 +1215,7 @@ def _extract_preamble(response_content: str) -> str:
     Returns empty string if there's no meaningful preamble.
     """
     # Find the first operation tag
-    tag_pattern = r"<(?:delegate|execute_skill|learn_skill|propose_skill|analyze_image|generate_image|edit_image|recall|remember)\s"
+    tag_pattern = r"<(?:delegate|execute_skill|learn_skill|propose_skill|analyze_image|generate_image|edit_image|recall|remember|learn)\s"
     match = re.search(tag_pattern, response_content)
     if not match:
         return ""
@@ -1233,7 +1305,7 @@ def _parse_vision_ops(text: str) -> list[dict]:
 def _strip_thinking(text: str) -> str:
     """Remove any <thinking> blocks and delegation XML from output."""
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
-    text = re.sub(r'<delegate\s+agent="\w+">.*?</delegate>', "", text, flags=re.DOTALL)
+    text = re.sub(r'<delegate\s+agent="\w+"[^>]*>.*?</delegate>', "", text, flags=re.DOTALL)
     text = re.sub(r"<learn_skill\s+.*?>.*?</learn_skill>", "", text, flags=re.DOTALL)
     text = re.sub(
         r"<execute_skill\s+.*?>.*?</execute_skill>", "", text, flags=re.DOTALL
@@ -1248,7 +1320,32 @@ def _strip_thinking(text: str) -> str:
     text = re.sub(r"<edit_image>.*?</edit_image>", "", text, flags=re.DOTALL)
     text = re.sub(r'<recall\s+topic="[^"]*">.*?</recall>', "", text, flags=re.DOTALL)
     text = re.sub(r'<remember\s+topic="[^"]*"[^>]*>.*?</remember>', "", text, flags=re.DOTALL)
+    text = re.sub(r'<learn\s+slug="[^"]*"[^>]*>.*?</learn>', "", text, flags=re.DOTALL)
     return text.strip()
+
+
+def _parse_knowledge_ops(text: str) -> list[dict]:
+    """Extract <learn> operations from LLM output."""
+    ops = []
+    learn_pattern = (
+        r'<learn\s+slug="([^"]+)"\s+title="([^"]+)"\s+tags="([^"]*)"\s+'
+        r'agents="([^"]*)"(?:\s+url="([^"]*)")?\s*>(.*?)</learn>'
+    )
+    for slug, title, tags_str, agents_str, url, content in re.findall(
+        learn_pattern, text, re.DOTALL
+    ):
+        tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+        agents = [a.strip() for a in agents_str.split(",") if a.strip()]
+        ops.append({
+            "type": "learn",
+            "slug": slug.strip(),
+            "title": title.strip(),
+            "tags": tags,
+            "agents": agents or ["*"],
+            "url": url.strip() if url else "",
+            "content": content.strip(),
+        })
+    return ops
 
 
 def _infer_skill_execution(text: str, registry: "SkillRegistry") -> dict | None:
