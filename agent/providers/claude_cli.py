@@ -40,6 +40,9 @@ MODEL_ALIASES = {
 }
 
 
+MAX_RATE_LIMIT_RETRIES = 3  # bail after this many rate limit retries from the CLI
+
+
 class ClaudeCLIProvider(BaseProvider):
     """Calls Claude via the CLI subprocess using your subscription."""
 
@@ -112,6 +115,7 @@ class ClaudeCLIProvider(BaseProvider):
             # that's actively streaming tool results can run for hours — it
             # only times out if it goes silent for self.timeout seconds.
             result = None
+            rate_limit_retries = 0
 
             while True:
                 try:
@@ -158,6 +162,25 @@ class ClaudeCLIProvider(BaseProvider):
                             log.info("claude_cli_text",
                                      model=cli_model, preview=text[:150])
                 elif etype == "system":
+                    # Detect rate limit retries and bail early so
+                    # ResilientProvider can fall back to another provider
+                    if event.get("subtype") == "api_retry" and event.get("error") == "rate_limit":
+                        rate_limit_retries += 1
+                        log.warning(
+                            "claude_cli_rate_limited",
+                            model=cli_model,
+                            attempt=rate_limit_retries,
+                            max=MAX_RATE_LIMIT_RETRIES,
+                        )
+                        if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
+                            try:
+                                proc.kill()
+                            except ProcessLookupError:
+                                pass
+                            raise RuntimeError(
+                                f"Claude CLI rate limited ({rate_limit_retries} retries). "
+                                "Bailing to allow fallback provider."
+                            )
                     log.info("claude_cli_system", model=cli_model,
                              data=json.dumps(event, default=str)[:300])
                 else:
