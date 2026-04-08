@@ -78,11 +78,32 @@ class GoogleProvider(BaseProvider):
             config=config,
         )
 
-        text = response.text or ""
+        # Extract text and any generated images from response parts.
+        # response.text is empty when the model returns image output, so we
+        # iterate candidates[0].content.parts directly.
+        import base64 as _b64
+        text = ""
+        image_bytes_list: list[bytes] = []
+        try:
+            parts = response.candidates[0].content.parts
+            for part in parts:
+                if hasattr(part, "inline_data") and part.inline_data:
+                    data = part.inline_data.data
+                    if isinstance(data, str):
+                        image_bytes_list.append(_b64.b64decode(data))
+                    else:
+                        image_bytes_list.append(bytes(data))
+                elif hasattr(part, "text") and part.text:
+                    text += part.text
+        except (AttributeError, IndexError):
+            # Fall back to .text for non-generative models
+            text = response.text or ""
+
         log.info(
             "google_response",
             model=model,
             content_len=len(text),
+            image_count=len(image_bytes_list),
         )
         usage = {}
         if response.usage_metadata:
@@ -91,7 +112,7 @@ class GoogleProvider(BaseProvider):
                 "output_tokens": response.usage_metadata.candidates_token_count or 0,
             }
 
-        return LLMResponse(content=text, model=model, usage=usage)
+        return LLMResponse(content=text, model=model, usage=usage, images=image_bytes_list)
 
     async def _upload_audio(self, data: bytes, mime_type: str, filename: str):
         """Upload audio via the Gemini File API and return a Part reference.

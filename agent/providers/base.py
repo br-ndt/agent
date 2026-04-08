@@ -10,6 +10,7 @@ class LLMResponse:
     model: str
     usage: dict = field(default_factory=dict)
     tool_calls: list = field(default_factory=list)
+    images: list[bytes] = field(default_factory=list)
 
 
 class BaseProvider(ABC):

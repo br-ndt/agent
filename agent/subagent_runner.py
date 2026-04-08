@@ -119,6 +119,7 @@ class SubagentRunner:
         self.fallback_model = fallback_model
         self.cost_tracker = cost_tracker
         self._pending_attachments: list[dict] | None = None
+        self._last_images: list[bytes] = []
 
     # ── Public entry point ────────────────────────────────────
 
@@ -300,6 +301,7 @@ class SubagentRunner:
                 allow_network="network" in self.config.tools or "git" in self.config.tools,
                 allow_packages="packages" in self.config.tools,
                 allow_git="git" in self.config.tools,
+                allow_sudo="sudo" in self.config.tools,
             )
         if "file_ops" in self.config.tools:
             if self.config.read_root:
@@ -316,7 +318,19 @@ class SubagentRunner:
         available = []
         if browser_tool:
             available.append(
-                "web_browser(url) — fetch content via full browser (handles JS, dynamic content, SPA)"
+                "web_browser(url) — navigate to a URL via full browser (handles JS, dynamic content, SPA)"
+            )
+            available.append(
+                'web_click(selector) — click an element (CSS selector or text, e.g. "text=Sign In", ".btn-primary")'
+            )
+            available.append(
+                'web_type(selector, text, submit) — type into an input field; set submit=true to press Enter'
+            )
+            available.append(
+                "web_search(query) — Google search shortcut, returns results page"
+            )
+            available.append(
+                "web_links() — list all clickable links/buttons on the current page"
             )
         if web_tool:
             available.append(
@@ -354,63 +368,69 @@ class SubagentRunner:
         messages = [{"role": "user", "content": tool_preamble + prompt}]
         response = None
 
-        for turn in range(MAX_TURNS):
-            start = time.monotonic()
-            response = await provider.complete(
-                messages=messages,
-                system=system,
-                model=model,
-                max_tokens=self.config.max_tokens,
-                temperature=self.config.temperature,
-                cwd=str(workspace),
-            )
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-
-            if self.cost_tracker:
-                await self.cost_tracker.log_call(
-                    provider=self.config.resolved_provider,
+        try:
+            for turn in range(MAX_TURNS):
+                start = time.monotonic()
+                response = await provider.complete(
+                    messages=messages,
+                    system=system,
                     model=model,
-                    usage=response.usage,
-                    agent=self.config.name,
-                    duration_ms=elapsed_ms,
+                    max_tokens=self.config.max_tokens,
+                    temperature=self.config.temperature,
+                    cwd=str(workspace),
                 )
+                elapsed_ms = int((time.monotonic() - start) * 1000)
 
-            log.info("subagent_turn", agent=self.config.name, turn=turn)
+                if self.cost_tracker:
+                    await self.cost_tracker.log_call(
+                        provider=self.config.resolved_provider,
+                        model=model,
+                        usage=response.usage,
+                        agent=self.config.name,
+                        duration_ms=elapsed_ms,
+                    )
 
-            tool_call = _extract_tool_call(response.content)
-            if not tool_call:
+                log.info("subagent_turn", agent=self.config.name, turn=turn)
+
+                tool_call = _extract_tool_call(response.content)
+                if not tool_call:
+                    log.info(
+                        "subagent_response",
+                        agent=self.config.name,
+                        content_len=len(response.content),
+                        content_preview=response.content[:500],
+                    )
+                    return response.content
+
+                tool_name = tool_call.get("tool", "")
+                args = tool_call.get("args", {})
                 log.info(
-                    "subagent_response",
+                    "subagent_tool_call",
                     agent=self.config.name,
-                    content_len=len(response.content),
+                    tool=tool_name,
+                    args_keys=list(args.keys()),
                 )
-                return response.content
 
-            tool_name = tool_call.get("tool", "")
-            args = tool_call.get("args", {})
-            log.info(
-                "subagent_tool_call",
-                agent=self.config.name,
-                tool=tool_name,
-                args_keys=list(args.keys()),
-            )
+                result = await _execute_tool(
+                    tool_name, args, bash_tool, file_tool, web_tool, browser_tool
+                )
 
-            result = await _execute_tool(
-                tool_name, args, bash_tool, file_tool, web_tool, browser_tool
-            )
+                messages.append({"role": "assistant", "content": response.content})
+                tool_msg = {
+                    "role": "user",
+                    "content": f"Tool result for `{tool_name}`:\n```\n{json.dumps(result, indent=2)}\n```",
+                }
+                # Attach screenshot as image if present (multimodal providers can see it)
+                if "screenshot" in result:
+                    tool_msg["images"] = [result["screenshot"]]
+                messages.append(tool_msg)
 
-            messages.append({"role": "assistant", "content": response.content})
-            tool_msg = {
-                "role": "user",
-                "content": f"Tool result for `{tool_name}`:\n```\n{json.dumps(result, indent=2)}\n```",
-            }
-            # Attach screenshot as image if present (multimodal providers can see it)
-            if "screenshot" in result:
-                tool_msg["images"] = [result["screenshot"]]
-            messages.append(tool_msg)
-
-        log.warning("subagent_max_turns", agent=self.config.name, turns=MAX_TURNS)
-        return response.content if response else ""
+            log.warning("subagent_max_turns", agent=self.config.name, turns=MAX_TURNS)
+            return response.content if response else ""
+        finally:
+            # Close the browser session when the tool loop ends
+            if browser_tool:
+                await browser_tool.close()
 
     # ── Path 3: Text only (no tools) ─────────────────────────
 
@@ -458,11 +478,14 @@ class SubagentRunner:
                 duration_ms=elapsed_ms,
             )
 
+        self._last_images = response.images
+
         log.info(
             "subagent_response",
             agent=self.config.name,
             content_len=len(response.content),
             content_preview=response.content[:500],
+            image_count=len(response.images),
             duration_ms=elapsed_ms,
         )
         return response.content
@@ -646,6 +669,18 @@ async def _execute_tool(
             return await web_tool.fetch(args.get("url", ""))
         elif tool_name == "web_browser" and browser_tool:
             return await browser_tool.fetch(args.get("url", ""))
+        elif tool_name == "web_click" and browser_tool:
+            return await browser_tool.click(args.get("selector", ""))
+        elif tool_name == "web_type" and browser_tool:
+            return await browser_tool.type_text(
+                args.get("selector", ""),
+                args.get("text", ""),
+                submit=args.get("submit", False),
+            )
+        elif tool_name == "web_search" and browser_tool:
+            return await browser_tool.search(args.get("query", ""))
+        elif tool_name == "web_links" and browser_tool:
+            return await browser_tool.get_links()
         else:
             return {"error": f"Unknown or unavailable tool: {tool_name}"}
     except Exception as e:
