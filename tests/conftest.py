@@ -12,8 +12,11 @@ from agent.state_ledger import StateLedger
 
 @pytest_asyncio.fixture
 async def memory_store(tmp_path):
-    """MemoryStore backed by a temp SQLite DB."""
-    store = MemoryStore(db_path=tmp_path / "memory.db")
+    """MemoryStore backed by a temp SQLite DB + temp ChromaDB dir."""
+    store = MemoryStore(
+        db_path=tmp_path / "memory.db",
+        chroma_dir=tmp_path / "chroma",
+    )
     await store.init()
     yield store
     await store.close()

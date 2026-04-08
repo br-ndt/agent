@@ -13,7 +13,7 @@ from agent.config import Config, infer_provider
 from agent.cost_tracker import CostTracker
 from agent.diagnostics import ErrorJournal, DiagnosticStore, build_diagnosis_prompt
 from agent.knowledge import KnowledgeStore, KnowledgeDoc
-from agent.memory import MemoryStore, build_memory_index_prompt
+from agent.memory import MemoryStore, build_memory_index_prompt, infer_room
 from agent.providers.base import BaseProvider
 from agent.providers.vision import VisionProvider
 from agent.persona_enforcement import check_output_for_violations
@@ -46,9 +46,15 @@ def _parse_memory_ops(text: str) -> list[dict]:
     for topic, reason in re.findall(recall_pattern, text, re.DOTALL):
         ops.append({"type": "recall", "topic": topic.strip(), "reason": reason.strip()})
 
-    # <remember topic="name" tags="t1,t2" global="true">content</remember>
-    remember_pattern = r'<remember\s+topic="([^"]+)"(?:\s+tags="([^"]*)")?(?:\s+global="([^"]*)")?\s*>(.*?)</remember>'
-    for topic, tags_str, global_str, content in re.findall(
+    # <remember topic="name" tags="t1,t2" room="auth" global="true">content</remember>
+    remember_pattern = (
+        r'<remember\s+topic="([^"]+)"'
+        r'(?:\s+tags="([^"]*)")?'
+        r'(?:\s+room="([^"]*)")?'
+        r'(?:\s+global="([^"]*)")?'
+        r'\s*>(.*?)</remember>'
+    )
+    for topic, tags_str, room_str, global_str, content in re.findall(
         remember_pattern, text, re.DOTALL
     ):
         tags = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else []
@@ -59,6 +65,7 @@ def _parse_memory_ops(text: str) -> list[dict]:
                 "topic": topic.strip(),
                 "content": content.strip(),
                 "tags": tags,
+                "room": room_str.strip() if room_str else "",
                 "global": is_global,
             }
         )
@@ -698,10 +705,21 @@ class Orchestrator:
                     content = topic.content[:2000]  # MAX_TOPIC_CONTENT
                     results.append(f"[Memory] Recalled '{op['topic']}':\n{content}")
                 else:
-                    # Try searching
+                    # Try semantic search — combine topic name + reason for a
+                    # richer query that ChromaDB can match against embeddings
+                    search_query = op["topic"]
+                    if op.get("reason"):
+                        search_query = f"{op['topic']} {op['reason']}"
+                    # Infer room to scope search for higher precision
+                    room_hint = infer_room(op["topic"], content=op.get("reason", ""))
                     matches = await self.memory_store.search_topics(
-                        session_id, op["topic"]
+                        session_id, search_query, room=room_hint
                     )
+                    # If room-scoped search found nothing, retry without room filter
+                    if not matches and room_hint != "general":
+                        matches = await self.memory_store.search_topics(
+                            session_id, search_query
+                        )
                     if matches:
                         lines = [
                             f"[Memory] Topic '{op['topic']}' not found exactly. Similar:"
@@ -722,6 +740,7 @@ class Orchestrator:
                     content=op["content"],
                     tags=op.get("tags", []),
                     global_=op.get("global", False),
+                    room=op.get("room", ""),
                 )
                 scope = "globally" if op.get("global") else "for this session"
                 results.append(f"[Memory] Remembered '{op['topic']}' {scope}")

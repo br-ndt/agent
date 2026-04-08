@@ -307,6 +307,20 @@ class TestMemoryOps:
         assert types.count("recall") == 2
         assert types.count("remember") == 1
 
+    def test_parse_remember_with_room(self):
+        from agent.orchestrator import _parse_memory_ops
+        text = '<remember topic="jwt-setup" tags="auth" room="auth">JWT token config</remember>'
+        ops = _parse_memory_ops(text)
+        assert len(ops) == 1
+        assert ops[0]["room"] == "auth"
+        assert ops[0]["topic"] == "jwt-setup"
+
+    def test_parse_remember_without_room(self):
+        from agent.orchestrator import _parse_memory_ops
+        text = '<remember topic="misc" tags="stuff">some content</remember>'
+        ops = _parse_memory_ops(text)
+        assert ops[0].get("room", "") == ""
+
     def test_parse_no_ops(self):
         from agent.orchestrator import _parse_memory_ops
         ops = _parse_memory_ops("Just a normal response with no XML.")

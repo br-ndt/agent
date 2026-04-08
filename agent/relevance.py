@@ -20,12 +20,12 @@ RELEVANCE_PROMPT = """You are a message router for a Discord bot named "{bot_nam
 Decide if {bot_name} should respond to this message. Respond with exactly one word:
 
 - YES: The message asks {bot_name} to do something, asks {bot_name} a question, or needs {bot_name}'s input.
-- NO: The message mentions {bot_name} in passing, talks ABOUT {bot_name}, thanks {bot_name} without asking anything new, is for another bot, or is general chatter. Acknowledgements like "thanks", "cool", "nice", "got it" are NO unless they include a follow-up question or request.
-- REACT: The message acknowledges {bot_name} or is a simple thanks/approval that deserves a reaction (thumbs up) but not a full reply.
+- REACT: The message mentions {bot_name} by name in ANY way — compliments, jokes, talking about {bot_name}, acknowledging {bot_name}, thanking {bot_name}, or referencing something {bot_name} did. If {bot_name}'s name appears and it's not a direct request, REACT. When in doubt between NO and REACT, choose REACT.
+- NO: The message does NOT mention {bot_name} at all, is clearly for another bot with no reference to {bot_name}, or is completely unrelated general chatter where {bot_name} is not referenced.
 - WAIT: The message tells {bot_name} to hold off, wait for someone else, or stand by.
 
-Key distinction: talking ABOUT {bot_name} is NOT talking TO {bot_name}.
-"calne did a good job" → NO. "calne can you fix this" → YES. "thanks calne" → REACT.
+Key distinction: if the message mentions {bot_name} by name, it should almost never be NO.
+"calne is such a fun fella" → REACT. "calne did a good job" → REACT. "thanks calne" → REACT. "calne can you fix this" → YES. "hey does anyone know about X" → NO.
 
 Other bots in this channel: {other_bots}
 
@@ -60,6 +60,7 @@ class RelevanceFilter:
         msg: IncomingMessage,
         is_dm: bool = False,
         is_mentioned: bool = False,
+        is_role_mentioned: bool = False,
     ) -> tuple[bool, str]:
         """Check if a message is relevant to this bot.
 
@@ -79,8 +80,12 @@ class RelevanceFilter:
         if is_mentioned and not self._mentions_other_entity(msg.text):
             return True, "mentioned"
 
+        # Fast path: role-mentioned with no other bots — also always process.
+        if is_role_mentioned and not self._mentions_other_entity(msg.text):
+            return True, "mentioned"
+
         # Not mentioned at all and name not in text — skip without LLM
-        if not is_mentioned and self.bot_name.lower() not in msg.text.lower():
+        if not is_mentioned and not is_role_mentioned and self.bot_name.lower() not in msg.text.lower():
             return False, "skip"
 
         # Ambiguous: name in text but not @mentioned, or multiple bots mentioned.
@@ -94,12 +99,20 @@ class RelevanceFilter:
                 other_bots_str = "unknown"
             other_bots_str = other_bots_str or "unknown"
 
+            role_hint = ""
+            if is_role_mentioned:
+                role_hint = (
+                    f"\n\nIMPORTANT: {self.bot_name}'s role was pinged in this message. "
+                    f"This means the sender intended to reach {self.bot_name} (among others). "
+                    f"Lean toward YES unless the message is clearly only for another bot."
+                )
+
             prompt = RELEVANCE_PROMPT.format(
                 bot_name=self.bot_name,
                 other_bots=other_bots_str,
                 sender=msg.sender_name,
                 message=msg.text[:500],
-            )
+            ) + role_hint
 
             response = await self.provider.complete(
                 messages=[{"role": "user", "content": prompt}],
@@ -129,7 +142,7 @@ class RelevanceFilter:
         except Exception as e:
             log.warning("relevance_filter_error", error=str(e))
             # On error, fall back to processing if mentioned, skip otherwise
-            if is_mentioned:
+            if is_mentioned or is_role_mentioned:
                 return True, "error_fallback"
             return False, "skip"
 

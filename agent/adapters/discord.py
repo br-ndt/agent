@@ -180,7 +180,8 @@ class DiscordAdapter(BaseAdapter):
                         chat_id=str(message.channel.id),
                     ),
                     is_dm=is_dm,
-                    is_mentioned=is_mentioned or is_role_mentioned,
+                    is_mentioned=is_mentioned,
+                    is_role_mentioned=is_role_mentioned,
                 )
 
                 if not relevant:

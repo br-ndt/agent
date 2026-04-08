@@ -16,6 +16,7 @@ Integration points:
     a single summary string
 """
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -35,6 +36,69 @@ MAX_INDEX_ENTRIES = 40
 # Maximum topic content size to inject into context
 MAX_TOPIC_CONTENT = 2000
 
+# ── Room inference ────────────────────────────────────────────
+
+ROOM_KEYWORDS: dict[str, set[str]] = {
+    "auth": {
+        "auth", "login", "logout", "jwt", "token", "session", "oauth",
+        "password", "credential", "permission", "rbac", "role", "signup",
+        "register", "sso", "saml", "mfa", "2fa", "cookie",
+    },
+    "data": {
+        "database", "sql", "postgres", "mysql", "sqlite", "mongo",
+        "schema", "migration", "table", "index", "query", "redis",
+        "cache", "caching", "orm", "model", "column", "row",
+    },
+    "api": {
+        "api", "endpoint", "rest", "graphql", "route", "request",
+        "response", "middleware", "handler", "controller", "grpc",
+        "webhook", "cors", "rate-limit", "ratelimit", "payload",
+    },
+    "frontend": {
+        "react", "vue", "svelte", "angular", "css", "html", "dom",
+        "component", "ui", "ux", "layout", "style", "tailwind",
+        "button", "form", "modal", "render", "browser", "jsx", "tsx",
+    },
+    "deploy": {
+        "deploy", "ci", "cd", "docker", "kubernetes", "k8s", "pipeline",
+        "systemd", "nginx", "terraform", "ansible", "github-actions",
+        "workflow", "build", "release", "artifact", "helm", "container",
+    },
+    "infra": {
+        "server", "hosting", "dns", "monitoring", "logging", "grafana",
+        "prometheus", "alert", "metric", "uptime", "load-balancer",
+        "ssl", "tls", "certificate", "s3", "aws", "gcp", "azure",
+        "cloud", "vpc", "firewall", "network",
+    },
+    "testing": {
+        "test", "testing", "pytest", "jest", "spec", "assert",
+        "mock", "fixture", "coverage", "e2e", "integration", "unit",
+        "ci", "regression", "snapshot",
+    },
+}
+
+
+def infer_room(topic: str, tags: list[str] | None = None, content: str = "") -> str:
+    """Infer a room name from topic metadata using keyword scoring.
+
+    Returns the best-matching room name, or "general" if no strong match.
+    """
+    # Build a bag of lowercase words from all inputs
+    text = f"{topic.replace('-', ' ')} {' '.join(tags or '')} {content[:500]}"
+    words = set(text.lower().split())
+
+    best_room = "general"
+    best_score = 0
+
+    for room, keywords in ROOM_KEYWORDS.items():
+        score = len(words & keywords)
+        if score > best_score:
+            best_score = score
+            best_room = room
+
+    # Require at least 2 keyword hits to avoid false positives
+    return best_room if best_score >= 2 else "general"
+
 
 @dataclass
 class MemoryPointer:
@@ -45,6 +109,7 @@ class MemoryPointer:
     last_accessed: float = 0.0
     access_count: int = 0
     tags: list[str] = field(default_factory=list)
+    room: str = ""  # hierarchical grouping, e.g. "auth", "deploy", "data"
 
     def to_index_line(self) -> str:
         """Format as a single line for context injection."""
@@ -69,9 +134,10 @@ class TopicMemory:
 class MemoryStore:
     """SQLite-backed storage for the pointer index and topic content."""
 
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None, chroma_dir: Path | None = None):
         self.db_path = db_path or DB_PATH
         self._db: aiosqlite.Connection | None = None
+        self.chroma = ChromaMemoryBackend(persist_dir=chroma_dir)
 
     async def init(self):
         """Create tables if needed."""
@@ -113,7 +179,168 @@ class MemoryStore:
             """
         )
         await self._db.commit()
+
+        # Schema migration: add room column to existing tables
+        for table in ("memory_index", "memory_topics", "memory_global"):
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN room TEXT DEFAULT ''"
+                )
+                await self._db.commit()
+                log.info("schema_migration", table=table, column="room")
+            except Exception:
+                pass  # column already exists
+
         log.info("memory_store_ready", db=str(self.db_path))
+
+        # Initialize ChromaDB semantic backend (non-blocking; degrades gracefully)
+        await self.chroma.init()
+
+        # Backfill: if ChromaDB is available but empty, seed it from SQLite
+        if self.chroma.available:
+            await self._backfill_chroma()
+
+        # Backfill: assign rooms to any topics that don't have one
+        await self._backfill_rooms()
+
+    # ── Backfill ──────────────────────────────────────────────
+
+    async def _backfill_chroma(self):
+        """One-time migration: copy all existing SQLite topics into ChromaDB.
+
+        Only runs when ChromaDB collection is empty (first start after upgrade).
+        Subsequent starts are a no-op.
+        """
+        loop = asyncio.get_running_loop()
+        count = await loop.run_in_executor(
+            None, lambda: self.chroma._collection.count()
+        )
+        if count > 0:
+            return  # already populated
+
+        if not self._db:
+            return
+
+        # Gather all session topics
+        async with self._db.execute(
+            """SELECT mt.session_id, mt.topic, mi.summary, mt.content, mi.tags
+               FROM memory_topics mt
+               LEFT JOIN memory_index mi
+                   ON mt.session_id = mi.session_id AND mt.topic = mi.topic"""
+        ) as cursor:
+            session_rows = await cursor.fetchall()
+
+        # Gather all global topics
+        async with self._db.execute(
+            "SELECT topic, summary, content, tags FROM memory_global"
+        ) as cursor:
+            global_rows = await cursor.fetchall()
+
+        total = len(session_rows) + len(global_rows)
+        if total == 0:
+            return
+
+        log.info("chroma_backfill_start", topics=total)
+
+        for sid, topic, summary, content, tags_json in session_rows:
+            try:
+                tags = json.loads(tags_json) if tags_json else []
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+            await self.chroma.upsert(
+                session_id=sid,
+                topic=topic,
+                summary=summary or "",
+                content=content or "",
+                tags=tags,
+            )
+
+        for topic, summary, content, tags_json in global_rows:
+            try:
+                tags = json.loads(tags_json) if tags_json else []
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+            await self.chroma.upsert(
+                session_id="global",
+                topic=topic,
+                summary=summary or "",
+                content=content or "",
+                tags=tags,
+                global_=True,
+            )
+
+        log.info("chroma_backfill_done", topics=total)
+
+    async def _backfill_rooms(self):
+        """Assign rooms to any topics that don't have one yet.
+
+        Runs on every init but only touches rows with empty room fields,
+        so it's effectively a no-op after the first pass.
+        """
+        if not self._db:
+            return
+
+        # Find session topics without a room
+        async with self._db.execute(
+            """SELECT mt.session_id, mt.topic, mi.tags, mt.content
+               FROM memory_topics mt
+               LEFT JOIN memory_index mi
+                   ON mt.session_id = mi.session_id AND mt.topic = mi.topic
+               WHERE mt.room = '' OR mt.room IS NULL"""
+        ) as cursor:
+            session_rows = await cursor.fetchall()
+
+        # Find global topics without a room
+        async with self._db.execute(
+            "SELECT topic, tags, content FROM memory_global WHERE room = '' OR room IS NULL"
+        ) as cursor:
+            global_rows = await cursor.fetchall()
+
+        total = len(session_rows) + len(global_rows)
+        if total == 0:
+            return
+
+        log.info("room_backfill_start", topics=total)
+
+        for sid, topic, tags_json, content in session_rows:
+            try:
+                tags = json.loads(tags_json) if tags_json else []
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+            room = infer_room(topic, tags, content or "")
+            await self._db.execute(
+                "UPDATE memory_topics SET room = ? WHERE session_id = ? AND topic = ?",
+                (room, sid, topic),
+            )
+            await self._db.execute(
+                "UPDATE memory_index SET room = ? WHERE session_id = ? AND topic = ?",
+                (room, sid, topic),
+            )
+            # Update ChromaDB metadata too
+            if self.chroma.available:
+                await self.chroma.upsert(
+                    session_id=sid, topic=topic, summary="",
+                    content=content or "", tags=tags, room=room,
+                )
+
+        for topic, tags_json, content in global_rows:
+            try:
+                tags = json.loads(tags_json) if tags_json else []
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+            room = infer_room(topic, tags, content or "")
+            await self._db.execute(
+                "UPDATE memory_global SET room = ? WHERE topic = ?",
+                (room, topic),
+            )
+            if self.chroma.available:
+                await self.chroma.upsert(
+                    session_id="global", topic=topic, summary="",
+                    content=content or "", tags=tags, room=room, global_=True,
+                )
+
+        await self._db.commit()
+        log.info("room_backfill_done", topics=total)
 
     # ── Index operations ─────────────────────────────────────
 
@@ -123,7 +350,7 @@ class MemoryStore:
             return []
 
         async with self._db.execute(
-            """SELECT topic, summary, tags, last_accessed, access_count
+            """SELECT topic, summary, tags, last_accessed, access_count, room
                FROM memory_index WHERE session_id = ?
                ORDER BY last_accessed DESC LIMIT ?""",
             (session_id, MAX_INDEX_ENTRIES),
@@ -131,7 +358,7 @@ class MemoryStore:
             rows = await cursor.fetchall()
 
         pointers = []
-        for topic, summary, tags_json, last_accessed, access_count in rows:
+        for topic, summary, tags_json, last_accessed, access_count, room in rows:
             try:
                 tags = json.loads(tags_json)
             except (json.JSONDecodeError, TypeError):
@@ -143,6 +370,7 @@ class MemoryStore:
                     last_accessed=last_accessed or 0.0,
                     access_count=access_count or 0,
                     tags=tags,
+                    room=room or "",
                 )
             )
         return pointers
@@ -153,7 +381,7 @@ class MemoryStore:
             return []
 
         async with self._db.execute(
-            """SELECT topic, summary, tags, last_accessed, access_count
+            """SELECT topic, summary, tags, last_accessed, access_count, room
                FROM memory_global
                ORDER BY last_accessed DESC LIMIT ?""",
             (MAX_INDEX_ENTRIES,),
@@ -161,7 +389,7 @@ class MemoryStore:
             rows = await cursor.fetchall()
 
         pointers = []
-        for topic, summary, tags_json, last_accessed, access_count in rows:
+        for topic, summary, tags_json, last_accessed, access_count, room in rows:
             try:
                 tags = json.loads(tags_json)
             except (json.JSONDecodeError, TypeError):
@@ -173,12 +401,14 @@ class MemoryStore:
                     last_accessed=last_accessed or 0.0,
                     access_count=access_count or 0,
                     tags=tags,
+                    room=room or "",
                 )
             )
         return pointers
 
     async def upsert_pointer(
-        self, session_id: str, topic: str, summary: str, tags: list[str] | None = None
+        self, session_id: str, topic: str, summary: str,
+        tags: list[str] | None = None, room: str = "",
     ):
         """Create or update a pointer in the session index."""
         if not self._db:
@@ -188,19 +418,21 @@ class MemoryStore:
         tags_json = json.dumps(tags or [])
 
         await self._db.execute(
-            """INSERT INTO memory_index (session_id, topic, summary, tags, last_accessed, access_count, created_at)
-               VALUES (?, ?, ?, ?, ?, 1, ?)
+            """INSERT INTO memory_index (session_id, topic, summary, tags, last_accessed, access_count, created_at, room)
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                ON CONFLICT(session_id, topic) DO UPDATE SET
                    summary = excluded.summary,
                    tags = excluded.tags,
                    last_accessed = excluded.last_accessed,
-                   access_count = access_count + 1""",
-            (session_id, topic, summary[:MAX_POINTER_LEN], tags_json, now, now),
+                   access_count = access_count + 1,
+                   room = CASE WHEN excluded.room != '' THEN excluded.room ELSE room END""",
+            (session_id, topic, summary[:MAX_POINTER_LEN], tags_json, now, now, room),
         )
         await self._db.commit()
 
     async def upsert_global_pointer(
-        self, topic: str, summary: str, content: str, tags: list[str] | None = None
+        self, topic: str, summary: str, content: str,
+        tags: list[str] | None = None, room: str = "",
     ):
         """Create or update a global (cross-session) memory entry."""
         if not self._db:
@@ -210,16 +442,17 @@ class MemoryStore:
         tags_json = json.dumps(tags or [])
 
         await self._db.execute(
-            """INSERT INTO memory_global (topic, summary, content, tags, last_accessed, access_count, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            """INSERT INTO memory_global (topic, summary, content, tags, last_accessed, access_count, created_at, updated_at, room)
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
                ON CONFLICT(topic) DO UPDATE SET
                    summary = excluded.summary,
                    content = excluded.content,
                    tags = excluded.tags,
                    last_accessed = excluded.last_accessed,
                    access_count = access_count + 1,
-                   updated_at = excluded.updated_at""",
-            (topic, summary[:MAX_POINTER_LEN], content, tags_json, now, now, now),
+                   updated_at = excluded.updated_at,
+                   room = CASE WHEN excluded.room != '' THEN excluded.room ELSE room END""",
+            (topic, summary[:MAX_POINTER_LEN], content, tags_json, now, now, now, room),
         )
         await self._db.commit()
 
@@ -284,35 +517,54 @@ class MemoryStore:
         content: str,
         tags: list[str] | None = None,
         global_: bool = False,
+        room: str = "",
     ):
         """Save topic content and update the index pointer."""
         if not self._db:
             return
 
+        # Auto-infer room if not provided
+        if not room:
+            room = infer_room(topic, tags, content)
+
         now = time.time()
 
         # Save topic content
         await self._db.execute(
-            """INSERT INTO memory_topics (session_id, topic, content, created_at, updated_at, source_session)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO memory_topics (session_id, topic, content, created_at, updated_at, source_session, room)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(session_id, topic) DO UPDATE SET
                    content = excluded.content,
-                   updated_at = excluded.updated_at""",
-            (session_id, topic, content[:10000], now, now, session_id),
+                   updated_at = excluded.updated_at,
+                   room = CASE WHEN excluded.room != '' THEN excluded.room ELSE room END""",
+            (session_id, topic, content[:10000], now, now, session_id, room),
         )
 
         # Update index pointer
-        await self.upsert_pointer(session_id, topic, summary, tags)
+        await self.upsert_pointer(session_id, topic, summary, tags, room=room)
 
         # Optionally save to global memory too
         if global_:
-            await self.upsert_global_pointer(topic, summary, content[:10000], tags)
+            await self.upsert_global_pointer(topic, summary, content[:10000], tags, room=room)
 
         await self._db.commit()
+
+        # Dual-write to ChromaDB for semantic search
+        await self.chroma.upsert(
+            session_id=session_id,
+            topic=topic,
+            summary=summary,
+            content=content[:10000],
+            tags=tags,
+            global_=global_,
+            room=room,
+        )
+
         log.info(
             "memory_topic_saved",
             session_id=session_id,
             topic=topic,
+            room=room,
             content_len=len(content),
             global_=global_,
         )
@@ -427,9 +679,45 @@ class MemoryStore:
         )
 
     async def search_topics(
-        self, session_id: str, query: str, limit: int = 5
+        self, session_id: str, query: str, limit: int = 5, room: str = "",
     ) -> list[MemoryPointer]:
-        """Simple keyword search across topic summaries and tags."""
+        """Search memory topics — prefers semantic (ChromaDB) with keyword fallback.
+
+        If room is provided, search is scoped to that room for higher precision.
+        """
+
+        # Try semantic search first
+        if self.chroma.available:
+            hits = await self.chroma.search(
+                query, session_id=session_id, room=room, limit=limit, max_distance=0.8
+            )
+            if hits:
+                # Convert chroma hits back to MemoryPointers for the existing interface
+                pointers = []
+                seen = set()
+                for hit in hits:
+                    topic = hit["topic"]
+                    if topic in seen:
+                        continue
+                    seen.add(topic)
+                    pointers.append(
+                        MemoryPointer(
+                            topic=topic,
+                            summary=hit.get("snippet", "")[:MAX_POINTER_LEN],
+                            tags=hit.get("tags", []),
+                            room=hit.get("room", ""),
+                        )
+                    )
+                if pointers:
+                    log.debug(
+                        "memory_semantic_search",
+                        query=query[:60],
+                        room=room or "*",
+                        hits=len(pointers),
+                    )
+                    return pointers
+
+        # Fallback: keyword search across topic summaries and tags
         if not self._db:
             return []
 
@@ -442,6 +730,9 @@ class MemoryStore:
 
         for p in all_pointers + global_pointers:
             if p.topic in seen:
+                continue
+            # If room filter is active, skip non-matching pointers
+            if room and p.room and p.room != room:
                 continue
             score = 0
             if query_lower in p.summary.lower():
@@ -471,10 +762,240 @@ class MemoryStore:
             "DELETE FROM memory_topics WHERE session_id = ?", (session_id,)
         )
         await self._db.commit()
+        await self.chroma.delete_session(session_id)
 
     async def close(self):
         if self._db:
             await self._db.close()
+
+
+# ── Semantic search backend (ChromaDB) ────────────────────────────
+
+CHROMA_DIR = Path(__file__).resolve().parent.parent / "state" / "chroma"
+
+try:
+    import chromadb
+
+    _CHROMA_AVAILABLE = True
+except ImportError:
+    _CHROMA_AVAILABLE = False
+
+
+class ChromaMemoryBackend:
+    """Vector-search layer over memory topics using ChromaDB.
+
+    Stores embeddings alongside the existing SQLite memory store so that
+    recall can fall back to semantic similarity when exact topic names
+    or keyword matches fail.
+
+    ChromaDB's default embedding function (all-MiniLM-L6-v2 via
+    sentence-transformers) runs locally — no API calls required.
+    """
+
+    def __init__(self, persist_dir: Path | None = None):
+        self._persist_dir = persist_dir or CHROMA_DIR
+        self._client: "chromadb.ClientAPI | None" = None
+        self._collection: "chromadb.Collection | None" = None
+
+    @property
+    def available(self) -> bool:
+        return _CHROMA_AVAILABLE and self._collection is not None
+
+    async def init(self):
+        """Initialize ChromaDB client and collection.
+
+        Runs the (synchronous) ChromaDB setup in a thread so we don't
+        block the event loop on first-time model download.
+        """
+        if not _CHROMA_AVAILABLE:
+            log.warning("chroma_not_installed", hint="pip install chromadb")
+            return
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self._init_sync)
+            log.info("chroma_backend_ready", persist_dir=str(self._persist_dir))
+        except Exception as exc:
+            log.error("chroma_init_failed", error=str(exc))
+
+    def _init_sync(self):
+        self._persist_dir.mkdir(parents=True, exist_ok=True)
+        self._client = chromadb.PersistentClient(path=str(self._persist_dir))
+        self._collection = self._client.get_or_create_collection(
+            name="memory_topics",
+            metadata={"hnsw:space": "cosine"},
+        )
+
+    # ── Write ──────────────────────────────────────────────
+
+    async def upsert(
+        self,
+        session_id: str,
+        topic: str,
+        summary: str,
+        content: str,
+        tags: list[str] | None = None,
+        global_: bool = False,
+        room: str = "",
+    ):
+        """Upsert a topic's embedding into the vector store."""
+        if not self.available:
+            return
+
+        # Combine summary + content for a richer embedding
+        doc_text = f"{topic}: {summary}\n\n{content}"[:8000]
+        doc_id = f"{session_id}::{topic}"
+
+        metadata = {
+            "session_id": session_id,
+            "topic": topic,
+            "global": global_,
+            "tags": ",".join(tags or []),
+            "room": room or "",
+            "updated_at": time.time(),
+        }
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: self._collection.upsert(
+                ids=[doc_id],
+                documents=[doc_text],
+                metadatas=[metadata],
+            ),
+        )
+
+        # For global topics, also store under a global:: prefix so cross-session
+        # searches can find them without knowing the original session_id.
+        if global_:
+            global_id = f"global::{topic}"
+            global_meta = {**metadata, "session_id": "global"}
+            await loop.run_in_executor(
+                None,
+                lambda: self._collection.upsert(
+                    ids=[global_id],
+                    documents=[doc_text],
+                    metadatas=[global_meta],
+                ),
+            )
+
+    # ── Search ─────────────────────────────────────────────
+
+    async def search(
+        self,
+        query: str,
+        session_id: str | None = None,
+        room: str = "",
+        limit: int = 5,
+        max_distance: float = 1.0,
+    ) -> list[dict]:
+        """Semantic search over stored topics.
+
+        Returns list of dicts with keys: topic, session_id, distance, room, snippet.
+        Results are sorted by relevance (lowest distance first).
+        If session_id is provided, results from that session and global topics are
+        returned; otherwise all topics are searched.
+        If room is provided, results are scoped to that room only.
+        Hits with cosine distance > max_distance are filtered out.
+        """
+        if not self.available:
+            return []
+
+        # Build where filter: session scope + optional room scope
+        conditions = []
+        if session_id:
+            conditions.append({
+                "$or": [
+                    {"session_id": {"$eq": session_id}},
+                    {"session_id": {"$eq": "global"}},
+                ]
+            })
+        if room:
+            conditions.append({"room": {"$eq": room}})
+
+        where_filter = None
+        if len(conditions) == 1:
+            where_filter = conditions[0]
+        elif len(conditions) > 1:
+            where_filter = {"$and": conditions}
+
+        loop = asyncio.get_running_loop()
+        try:
+            results = await loop.run_in_executor(
+                None,
+                lambda: self._collection.query(
+                    query_texts=[query],
+                    n_results=limit,
+                    where=where_filter,
+                    include=["metadatas", "distances", "documents"],
+                ),
+            )
+        except Exception as exc:
+            log.error("chroma_search_failed", error=str(exc))
+            return []
+
+        hits = []
+        if not results or not results["ids"] or not results["ids"][0]:
+            return hits
+
+        for i, doc_id in enumerate(results["ids"][0]):
+            meta = results["metadatas"][0][i] if results["metadatas"] else {}
+            distance = results["distances"][0][i] if results["distances"] else 1.0
+            doc = results["documents"][0][i] if results["documents"] else ""
+
+            if distance > max_distance:
+                continue
+
+            hits.append({
+                "topic": meta.get("topic", doc_id),
+                "session_id": meta.get("session_id", ""),
+                "distance": distance,
+                "room": meta.get("room", ""),
+                "tags": meta.get("tags", "").split(",") if meta.get("tags") else [],
+                "snippet": doc[:200] if doc else "",
+            })
+
+        return hits
+
+    # ── Lifecycle ──────────────────────────────────────────
+
+    async def delete_session(self, session_id: str):
+        """Remove all embeddings for a session."""
+        if not self.available:
+            return
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: self._collection.delete(
+                    where={"session_id": {"$eq": session_id}},
+                ),
+            )
+        except Exception as exc:
+            log.error("chroma_delete_failed", error=str(exc))
+
+
+def _group_pointers_by_room(pointers: list[MemoryPointer]) -> list[str]:
+    """Group pointers by room for hierarchical display."""
+    from collections import defaultdict
+
+    rooms: dict[str, list[MemoryPointer]] = defaultdict(list)
+    for p in pointers:
+        rooms[p.room or "general"].append(p)
+
+    lines = []
+    # Sort rooms alphabetically, but put "general" last
+    sorted_rooms = sorted(rooms.keys(), key=lambda r: (r == "general", r))
+    use_headers = len(sorted_rooms) > 1 or (len(sorted_rooms) == 1 and "general" not in sorted_rooms)
+
+    for room in sorted_rooms:
+        if use_headers:
+            lines.append(f"**{room}**")
+        for p in rooms[room]:
+            lines.append(p.to_index_line())
+
+    return lines
 
 
 def build_memory_index_prompt(
@@ -501,13 +1022,11 @@ def build_memory_index_prompt(
 
     if pointers:
         lines.append("\n### Session memories")
-        for p in pointers:
-            lines.append(p.to_index_line())
+        lines.extend(_group_pointers_by_room(pointers))
 
     if global_pointers:
         lines.append("\n### Cross-session knowledge")
-        for p in global_pointers:
-            lines.append(p.to_index_line())
+        lines.extend(_group_pointers_by_room(global_pointers))
 
     if not pointers and not global_pointers:
         lines.append("\nNo memories stored yet.")
