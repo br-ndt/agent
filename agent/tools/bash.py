@@ -22,13 +22,12 @@ log = structlog.get_logger()
 
 # Commands that are never allowed
 BLOCKED_COMMANDS = [
-    "sudo", "su ",
+    "su ",
     "rm -rf /", "rm -rf /*",
     "mkfs", "dd if=",
     "shutdown", "reboot", "halt", "poweroff",
     "passwd", "useradd", "usermod", "userdel",
     "iptables", "ufw",
-    "systemctl", "service ",
     "curl |", "wget |",          # Piped downloads (install scripts)
     "> /dev/", ">/dev/",
     "chmod 777",
@@ -38,6 +37,7 @@ BLOCKED_COMMANDS = [
 GATED_COMMANDS = {
     "network": ["curl", "wget", "ssh", "scp", "nc", "nmap", "ping"],
     "package": ["pip", "npm", "apt", "uv add"],
+    "sudo": ["sudo", "systemctl", "service "],
 }
 
 DEFAULT_TIMEOUT = 30
@@ -72,12 +72,14 @@ class BashTool:
         allow_network: bool = False,
         allow_packages: bool = False,
         allow_git: bool = False,
+        allow_sudo: bool = False,
     ):
         self.workspace = Path(workspace)
         self.timeout = timeout
         self.allow_network = allow_network
         self.allow_packages = allow_packages
         self.allow_git = allow_git
+        self.allow_sudo = allow_sudo
 
         # Create workspace if needed
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -101,6 +103,11 @@ class BashTool:
             for cmd in GATED_COMMANDS["package"]:
                 if cmd_lower.startswith(cmd) or f" {cmd}" in cmd_lower:
                     return f"Package command '{cmd}' not allowed (enable allow_packages)"
+
+        if not self.allow_sudo:
+            for cmd in GATED_COMMANDS["sudo"]:
+                if cmd_lower.startswith(cmd) or f" {cmd}" in cmd_lower or f"|{cmd}" in cmd_lower:
+                    return f"Command '{cmd}' not allowed (enable allow_sudo)"
 
         # Block path traversal outside workspace (git submodules may need ..)
         if ".." in command and ("/" in command or "\\" in command):
