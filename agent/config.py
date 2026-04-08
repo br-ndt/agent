@@ -52,6 +52,7 @@ class SubagentConfig:
     temperature: float = 0.7
     workspace_dir: str = ""   # override workspace (write boundary); default: workspaces/<name>/
     read_root: str = ""       # override read boundary; default: workspaces/
+    capabilities: list[str] = field(default_factory=list)  # e.g. ["audio_analysis", "image_analysis"]
 
     @property
     def resolved_provider(self) -> str:
@@ -154,6 +155,7 @@ def _apply_yaml(cfg: Config, raw: dict):
             temperature=sa_raw.get("temperature", 0.7),
             workspace_dir=sa_raw.get("workspace_dir", ""),
             read_root=sa_raw.get("read_root", ""),
+            capabilities=sa_raw.get("capabilities", []),
         )
 
     # Access control

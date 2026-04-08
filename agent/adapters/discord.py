@@ -18,6 +18,34 @@ log = structlog.get_logger()
 
 MAX_LEN = 2000
 
+# File extensions we treat as text (inlined into the message)
+_TEXT_EXTENSIONS = {
+    ".txt", ".md", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml",
+    ".yml", ".toml", ".cfg", ".ini", ".conf", ".sh", ".bash", ".zsh",
+    ".html", ".css", ".scss", ".less", ".xml", ".svg", ".csv", ".sql",
+    ".rs", ".go", ".java", ".kt", ".c", ".cpp", ".h", ".hpp", ".cs",
+    ".rb", ".php", ".lua", ".r", ".swift", ".scala", ".ex", ".exs",
+    ".hs", ".ml", ".clj", ".erl", ".elm", ".vue", ".svelte", ".astro",
+    ".env", ".gitignore", ".dockerignore", ".dockerfile", ".makefile",
+    ".log", ".diff", ".patch", ".rst", ".tex", ".org",
+}
+
+
+def _is_text_attachment(content_type: str, filename: str) -> bool:
+    """Check if an attachment is a text file we should inline."""
+    if content_type.startswith("text/"):
+        return True
+    # application/json, application/xml, etc.
+    if content_type in (
+        "application/json", "application/xml", "application/javascript",
+        "application/x-yaml", "application/toml", "application/sql",
+        "application/x-sh", "application/x-python",
+    ):
+        return True
+    # Fall back to extension check
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return ext in _TEXT_EXTENSIONS
+
 
 def _split_message(text: str, limit: int = MAX_LEN) -> list[str]:
     """Split text into chunks that respect Discord's character limit.
@@ -290,32 +318,61 @@ class DiscordAdapter(BaseAdapter):
 
             final_text = channel_context + text + system_context
 
-            # Extract image attachments
+            # Extract attachments: images/audio as binary, text files inlined
             attachments = []
+            text_attachments = []
             for attachment in message.attachments:
-                if attachment.content_type and attachment.content_type.startswith(
-                    "image/"
-                ):
+                ct = attachment.content_type or ""
+                fname = attachment.filename or ""
+
+                if ct.startswith("image/") or ct.startswith("audio/"):
                     try:
-                        image_bytes = await attachment.read()
+                        file_bytes = await attachment.read()
                         attachments.append(
                             {
-                                "data": image_bytes,
-                                "mime_type": attachment.content_type,
-                                "filename": attachment.filename,
+                                "data": file_bytes,
+                                "mime_type": ct,
+                                "filename": fname,
                             }
                         )
+                        kind = "image" if ct.startswith("image/") else "audio"
                         log.info(
-                            "discord_image_extracted",
-                            filename=attachment.filename,
-                            size=len(image_bytes),
+                            f"discord_{kind}_extracted",
+                            filename=fname,
+                            size=len(file_bytes),
                         )
                     except Exception as e:
                         log.error(
-                            "discord_image_download_failed",
-                            filename=attachment.filename,
+                            "discord_attachment_download_failed",
+                            filename=fname,
                             error=str(e),
                         )
+                elif _is_text_attachment(ct, fname):
+                    try:
+                        file_bytes = await attachment.read()
+                        text_content = file_bytes.decode("utf-8", errors="replace")
+                        # Cap at 15k chars to avoid blowing up context
+                        if len(text_content) > 15000:
+                            text_content = text_content[:15000] + "\n\n... (truncated)"
+                        text_attachments.append((fname, text_content))
+                        log.info(
+                            "discord_text_extracted",
+                            filename=fname,
+                            size=len(file_bytes),
+                        )
+                    except Exception as e:
+                        log.error(
+                            "discord_text_download_failed",
+                            filename=fname,
+                            error=str(e),
+                        )
+
+            # Inline text attachments into the message
+            if text_attachments:
+                parts = []
+                for fname, content in text_attachments:
+                    parts.append(f"[Attached file: {fname}]\n```\n{content}\n```")
+                final_text = "\n\n".join(parts) + "\n\n" + final_text
 
             msg = IncomingMessage(
                 platform="discord",
@@ -332,7 +389,7 @@ class DiscordAdapter(BaseAdapter):
                 channel=str(message.channel),
                 is_dm=is_dm,
                 text_len=len(text),
-                has_images=len(attachments) > 0,
+                has_attachments=len(attachments) > 0,
             )
 
             try:

@@ -1,5 +1,7 @@
-"""Google (Gemini) provider — supports text and image inputs."""
+"""Google (Gemini) provider — supports text, image, and audio inputs."""
 
+import asyncio
+import tempfile
 import structlog
 from pathlib import Path
 
@@ -47,6 +49,20 @@ class GoogleProvider(BaseProvider):
                         mime_type="image/png",
                     ))
 
+            # Attach audio if present — use File API for reliability
+            for aud in msg.get("audio", []):
+                data = aud["data"] if isinstance(aud, dict) else aud
+                mime = aud.get("mime_type", "audio/mpeg") if isinstance(aud, dict) else "audio/mpeg"
+                filename = aud.get("filename", "audio.mp3") if isinstance(aud, dict) else "audio.mp3"
+                try:
+                    file_part = await self._upload_audio(data, mime, filename)
+                    parts.append(file_part)
+                    log.info("audio_attached", filename=filename, size=len(data), mime=mime)
+                except Exception as exc:
+                    log.error("audio_upload_failed", error=str(exc), filename=filename)
+                    # Fall back to inline bytes
+                    parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+
             contents.append(types.Content(role=role, parts=parts))
 
         config = types.GenerateContentConfig(
@@ -76,3 +92,37 @@ class GoogleProvider(BaseProvider):
             }
 
         return LLMResponse(content=text, model=model, usage=usage)
+
+    async def _upload_audio(self, data: bytes, mime_type: str, filename: str):
+        """Upload audio via the Gemini File API and return a Part reference.
+
+        The File API handles large files and is more reliable for audio than
+        inline Part.from_bytes.
+        """
+        # Map common mime types to file extensions
+        ext_map = {
+            "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+            "audio/wav": ".wav", "audio/x-wav": ".wav",
+            "audio/ogg": ".ogg", "audio/flac": ".flac",
+            "audio/aac": ".aac", "audio/mp4": ".m4a",
+        }
+        ext = ext_map.get(mime_type, ".mp3")
+
+        # Write to temp file (Gemini SDK needs a file path for upload)
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+
+        try:
+            loop = asyncio.get_running_loop()
+            uploaded = await loop.run_in_executor(
+                None,
+                lambda: self.client.files.upload(
+                    file=tmp_path,
+                    config=types.UploadFileConfig(mime_type=mime_type),
+                ),
+            )
+            log.info("audio_file_uploaded", name=uploaded.name, size=len(data))
+            return types.Part.from_uri(file_uri=uploaded.uri, mime_type=mime_type)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)

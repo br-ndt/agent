@@ -110,21 +110,27 @@ class Router:
         try:
             tier_route = self.config.tier_routing.get(tier, {})
             
-            # Extract images from attachments
+            # Extract images and audio from attachments
             images = None
+            audio = None
             if msg.attachments:
                 images = []
+                audio = []
                 for att in msg.attachments:
-                    if att.get("mime_type", "").startswith("image/"):
-                        images.append(
-                            {
-                                "data": att.get("data"),
-                                "mime_type": att["mime_type"],
-                                "filename": att.get("filename", "image"),
-                            }
-                        )
+                    mime = att.get("mime_type", "")
+                    entry = {
+                        "data": att.get("data"),
+                        "mime_type": mime,
+                        "filename": att.get("filename", "file"),
+                    }
+                    if mime.startswith("image/"):
+                        images.append(entry)
+                    elif mime.startswith("audio/"):
+                        audio.append(entry)
                 if not images:
                     images = None
+                if not audio:
+                    audio = None
 
             # Call orchestrator (returns dict with text + images)
             result = await self.orchestrator.handle(
@@ -134,6 +140,7 @@ class Router:
                 tier=tier,
                 tier_route=tier_route,
                 images=images,
+                audio=audio,
             )
             
             # Handle response - orchestrator now returns dict

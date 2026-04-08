@@ -201,7 +201,8 @@ class BashTool:
 
             if self.allow_git:
                 from agent.subagent_runner import _get_agent_gitconfig, _agent_git_identity
-                name, email = _agent_git_identity()
+                name, email = await _agent_git_identity()
+                gitconfig_path = await _get_agent_gitconfig()
                 home = os.path.expanduser("~")
                 env.update({
                     "HOME": home,  # git/gh need real HOME for SSH + config
@@ -209,7 +210,7 @@ class BashTool:
                     "GIT_AUTHOR_EMAIL": email,
                     "GIT_COMMITTER_NAME": name,
                     "GIT_COMMITTER_EMAIL": email,
-                    "GIT_CONFIG_GLOBAL": str(_get_agent_gitconfig()),
+                    "GIT_CONFIG_GLOBAL": str(gitconfig_path),
                     "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND", ""),
                     "GH_CONFIG_DIR": os.path.join(home, ".config", "gh"),
                 })
@@ -220,6 +221,7 @@ class BashTool:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.workspace),
                 env=env,
+                start_new_session=True,  # own process group for clean kill
             )
 
             try:
@@ -228,7 +230,12 @@ class BashTool:
                     timeout=self.timeout,
                 )
             except asyncio.TimeoutError:
-                proc.kill()
+                # Kill the entire process group (shell + children)
+                import signal
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
                 await proc.wait()
                 log.warning("bash_timeout", command=command[:100], timeout=self.timeout)
                 return {

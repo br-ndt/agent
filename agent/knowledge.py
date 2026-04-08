@@ -143,10 +143,6 @@ class KnowledgeStore:
         self._loaded = True
         log.info("knowledge_loaded", count=len(self._docs))
 
-    def reload(self):
-        """Reload all knowledge docs from disk."""
-        self.load()
-
     def _parse_file(self, path: Path) -> KnowledgeDoc:
         """Parse a single knowledge markdown file."""
         text = path.read_text()

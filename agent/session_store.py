@@ -157,6 +157,9 @@ class PersistentSession:
         self.images: list[dict] = []
         self.last_generated_image: bytes | None = None
 
+        # Audio support
+        self.audio: list[dict] = []
+
     async def ensure_loaded(self):
         """Lazy-load from DB on first access."""
         if self._loaded:

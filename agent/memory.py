@@ -181,6 +181,7 @@ class MemoryStore:
         await self._db.commit()
 
         # Schema migration: add room column to existing tables
+        import sqlite3
         for table in ("memory_index", "memory_topics", "memory_global"):
             try:
                 await self._db.execute(
@@ -188,7 +189,7 @@ class MemoryStore:
                 )
                 await self._db.commit()
                 log.info("schema_migration", table=table, column="room")
-            except Exception:
+            except sqlite3.OperationalError:
                 pass  # column already exists
 
         log.info("memory_store_ready", db=str(self.db_path))
@@ -594,6 +595,18 @@ class MemoryStore:
         if not new_words:
             return None
 
+        # Batch-fetch all topic content in one query to avoid N+1
+        topic_contents: dict[str, str] = {}
+        if self._db:
+            placeholders = ",".join("?" for _ in pointers)
+            topic_names = [p.topic for p in pointers]
+            async with self._db.execute(
+                f"SELECT topic, content FROM memory_topics WHERE session_id = ? AND topic IN ({placeholders})",
+                [session_id] + topic_names,
+            ) as cursor:
+                async for row_topic, row_content in cursor:
+                    topic_contents[row_topic] = row_content or ""
+
         best_match = None
         best_score = 0.0
 
@@ -601,17 +614,16 @@ class MemoryStore:
             if p.topic == topic:
                 continue  # don't match self
 
-            # Build word set from existing topic name + summary
+            # Build word set from existing topic name + summary + content
             existing_words = set(
                 w.lower() for w in f"{p.topic} {p.summary}".replace("-", " ").split()
                 if len(w) > 3 and w.isalpha()
             )
 
-            # Also check the stored content for better matching
-            existing_topic = await self.get_topic(session_id, p.topic)
-            if existing_topic:
+            existing_content = topic_contents.get(p.topic, "")
+            if existing_content:
                 existing_words.update(
-                    w.lower() for w in existing_topic.content.split()
+                    w.lower() for w in existing_content.split()
                     if len(w) > 3 and w.isalpha()
                 )
 

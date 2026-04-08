@@ -73,6 +73,36 @@ def _parse_memory_ops(text: str) -> list[dict]:
     return ops
 
 
+# Refusal / inability patterns that indicate the subagent didn't actually
+# engage with the media content it was sent.
+_MEDIA_REFUSAL_PATTERNS = re.compile(
+    r"(?i)"
+    r"(can'?t\s+(?:\w+\s+)?(listen|hear|play|process|access)\s+(to\s+)?(the |this )?(audio|music|track|file|sound|image|video))"
+    r"|(unable to\s+(?:\w+\s+)?(listen|hear|play|process|access|analyze))"
+    r"|(no (audio|music|sound) (processing|analysis|playback))"
+    r"|(don'?t have (the ability|access) to (listen|hear|play|process))"
+    r"|(as (a |an )?(text|language)[\s-]*(only|based))"
+    r"|(cannot\s+(?:\w+\s+)?(listen|hear|play|process|access)\s+(to\s+)?(the |this )?(audio|music|track|file|sound))"
+    r"|(based on the (file\s?name|metadata|title|transcript))"
+    r"|(from the (file\s?name|metadata|title|transcript))"
+    r"|(can(?:not|'t)\s+(?:\w+\s+)?(?:directly\s+)?(?:hear|listen|perceive|interpret)\s)"
+)
+
+
+def _looks_like_media_analysis(text: str) -> bool:
+    """Return True if the text looks like the subagent actually analyzed media.
+
+    Returns False if the response contains refusal patterns suggesting the
+    model couldn't process the media, or if the response is too short to
+    be a real analysis.
+    """
+    if len(text.strip()) < 100:
+        return False
+    if _MEDIA_REFUSAL_PATTERNS.search(text):
+        return False
+    return True
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -114,6 +144,10 @@ class Orchestrator:
 
         # Active subagent delegations: agent_name -> {task, session_id, description}
         self._active_delegations: dict[str, dict] = {}
+        self._delegation_lock = asyncio.Lock()
+
+        # Background diagnostic tasks (so they aren't orphaned on shutdown)
+        self._diag_tasks: set[asyncio.Task] = set()
 
         # Pending background results: session_id -> list of result strings
         # These are results from background tasks that completed while the user
@@ -164,7 +198,9 @@ class Orchestrator:
             if len(first_line) > 120:
                 first_line = first_line[:117] + "..."
             tools = ", ".join(runner.config.tools) if runner.config.tools else "none"
-            agent_descriptions.append(f"- **{name}** [{tools}]: {first_line}")
+            caps = runner.config.capabilities
+            caps_str = f" (capabilities: {', '.join(caps)})" if caps else ""
+            agent_descriptions.append(f"- **{name}** [{tools}]{caps_str}: {first_line}")
         agent_guide = "\n".join(agent_descriptions)
 
         prompt = self.config.orchestrator_system_prompt.replace(
@@ -325,6 +361,7 @@ class Orchestrator:
         tier: str = "admin",
         tier_route: dict[str, str] | None = None,
         images: list[dict] | None = None,
+        audio: list[dict] | None = None,
     ) -> dict:
         """Handle a user message via multi-pass orchestration.
 
@@ -380,6 +417,26 @@ class Orchestrator:
             filenames = [img.get("filename", "image") for img in images]
             user_msg = (
                 f"[{len(images)} image(s) attached: {', '.join(filenames)}]\n\n"
+                + user_msg
+            )
+
+        if audio:
+            session.audio = audio
+            log.info("audio_received", count=len(audio))
+            filenames = [a.get("filename", "audio") for a in audio]
+            # Find subagents with audio_analysis capability
+            audio_agents = [
+                name for name, runner in self.subagents.items()
+                if "audio_analysis" in (runner.config.capabilities or [])
+            ]
+            routing_hint = ""
+            if audio_agents:
+                routing_hint = (
+                    f" You cannot listen to audio yourself — delegate to "
+                    f"{audio_agents[0]} who can analyze audio files directly."
+                )
+            user_msg = (
+                f"[{len(audio)} audio file(s) attached: {', '.join(filenames)}.{routing_hint}]\n\n"
                 + user_msg
             )
 
@@ -592,6 +649,7 @@ class Orchestrator:
                     valid_delegations,
                     user_msg,
                     session_id,
+                    session=session,
                 )
                 pass_results.extend(d_results)
 
@@ -613,6 +671,7 @@ class Orchestrator:
                 "pass_results_fed_back",
                 pass_num=pass_num,
                 result_count=len(pass_results),
+                results_preview=results_msg[:800],
             )
 
             # After last allowed pass, the next iteration will be the
@@ -1011,6 +1070,7 @@ class Orchestrator:
         delegations: list[dict],
         user_msg: str,
         session_id: str,
+        session=None,
     ) -> list[str]:
         """Run subagent delegations concurrently. Returns formatted results.
 
@@ -1019,34 +1079,36 @@ class Orchestrator:
         results: list[str] = []
         to_run: list[dict] = []
 
-        # Guard: skip subagents that are already busy
-        for d in delegations:
-            agent_name = d["agent"]
-            if agent_name in self._active_delegations:
-                busy_info = self._active_delegations[agent_name]
-                results.append(
-                    f"[{agent_name}] BUSY: Currently working on a task "
-                    f"for session {busy_info.get('session_id', '?')[:20]}. "
-                    f"Try again when it's done."
-                )
-                log.info(
-                    "delegation_skipped_busy",
-                    agent=agent_name,
-                    busy_session=busy_info.get("session_id"),
-                )
-            else:
-                to_run.append(d)
+        # Guard: skip subagents that are already busy (lock protects
+        # concurrent check-then-set from multiple handle() calls)
+        async with self._delegation_lock:
+            for d in delegations:
+                agent_name = d["agent"]
+                if agent_name in self._active_delegations:
+                    busy_info = self._active_delegations[agent_name]
+                    results.append(
+                        f"[{agent_name}] BUSY: Currently working on a task "
+                        f"for session {busy_info.get('session_id', '?')[:20]}. "
+                        f"Try again when it's done."
+                    )
+                    log.info(
+                        "delegation_skipped_busy",
+                        agent=agent_name,
+                        busy_session=busy_info.get("session_id"),
+                    )
+                else:
+                    to_run.append(d)
 
-        if not to_run:
-            return results
+            if not to_run:
+                return results
 
-        # Mark subagents as busy
-        for d in to_run:
-            self._active_delegations[d["agent"]] = {
-                "session_id": session_id,
-                "task": d["task"][:200],
-                "started_at": time.time(),
-            }
+            # Mark subagents as busy (still under lock)
+            for d in to_run:
+                self._active_delegations[d["agent"]] = {
+                    "session_id": session_id,
+                    "task": d["task"][:200],
+                    "started_at": time.time(),
+                }
 
         # Inject relevant knowledge into each delegation task
         for d in to_run:
@@ -1062,11 +1124,25 @@ class Orchestrator:
                     docs=[doc.slug for doc in docs],
                 )
 
+        # Track which delegations got media attachments
+        delegations_with_media: dict[str, str] = {}
+
         try:
-            tasks = [
-                self.subagents[d["agent"]].run(d["task"], context=user_msg)
-                for d in to_run
-            ]
+            tasks = []
+            for d in to_run:
+                runner = self.subagents[d["agent"]]
+                # Pass audio/image attachments to subagents that support them
+                attachments = None
+                caps = getattr(runner.config, "capabilities", []) or []
+                if session and "audio_analysis" in caps and session.audio:
+                    attachments = session.audio
+                    delegations_with_media[d["agent"]] = "audio"
+                elif session and "image_analysis" in caps and session.images:
+                    attachments = session.images
+                    delegations_with_media[d["agent"]] = "image"
+                tasks.append(
+                    runner.run(d["task"], context=user_msg, attachments=attachments)
+                )
             raw_results = await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             # Clear busy state
@@ -1111,7 +1187,19 @@ class Orchestrator:
                 if violations:
                     sanitized += "\n\n⚠️ Persona violations:\n"
                     sanitized += "\n".join(f"- {v}" for v in violations)
-                results.append(f"[{d['agent']}] Result:\n{sanitized}")
+                # If the subagent received media, annotate the result so the
+                # synthesis model doesn't project its own inability to process
+                # media onto the subagent's response. But only if the response
+                # looks like it actually engaged (not a refusal or error).
+                media_type = delegations_with_media.get(d["agent"])
+                if media_type and _looks_like_media_analysis(sanitized):
+                    media_note = (
+                        f" (this agent received and directly analyzed the {media_type}"
+                        f" — trust its analysis as authoritative)"
+                    )
+                    results.append(f"[{d['agent']}]{media_note} Result:\n{sanitized}")
+                else:
+                    results.append(f"[{d['agent']}] Result:\n{sanitized}")
 
         # Fire-and-forget auto-diagnosis for failures
         has_errors = any(isinstance(r, Exception) for r in raw_results)
@@ -1174,7 +1262,9 @@ class Orchestrator:
             except Exception as e:
                 log.warning("auto_diagnose_failed", event=event, error=str(e))
 
-        asyncio.create_task(_run())
+        task = asyncio.create_task(_run())
+        self._diag_tasks.add(task)
+        task.add_done_callback(self._diag_tasks.discard)
 
 
 

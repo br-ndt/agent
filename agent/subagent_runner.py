@@ -118,11 +118,19 @@ class SubagentRunner:
         self.fallback_provider = fallback_provider
         self.fallback_model = fallback_model
         self.cost_tracker = cost_tracker
+        self._pending_attachments: list[dict] | None = None
 
     # ── Public entry point ────────────────────────────────────
 
-    async def run(self, task: str, context: str = "", session_id: str = "") -> str:
-        """Execute a task, routing to the right tool path per provider."""
+    async def run(
+        self, task: str, context: str = "", session_id: str = "",
+        attachments: list[dict] | None = None,
+    ) -> str:
+        """Execute a task, routing to the right tool path per provider.
+
+        attachments: optional list of dicts with 'data' (bytes), 'mime_type', 'filename'.
+            These are passed through to the LLM provider as inline parts (e.g. audio/image).
+        """
         prompt = task
         if context:
             prompt = f"Context:\n{context}\n\nTask:\n{task}"
@@ -144,7 +152,10 @@ class SubagentRunner:
             model=self.config.model,
             has_tools=has_tools,
             task_len=len(task),
+            has_attachments=bool(attachments),
         )
+
+        self._pending_attachments = attachments
 
         try:
             return await self._run_with(
@@ -162,6 +173,8 @@ class SubagentRunner:
             return await self._run_with(
                 self.fallback_provider, self.fallback_model, prompt, workspace, has_tools
             )
+        finally:
+            self._pending_attachments = None
 
     # ── Dispatch ──────────────────────────────────────────────
 
@@ -261,6 +274,7 @@ class SubagentRunner:
             "subagent_response",
             agent=self.config.name,
             content_len=len(response.content),
+            content_preview=response.content[:500],
             duration_ms=elapsed_ms,
         )
         return response.content
@@ -408,8 +422,25 @@ class SubagentRunner:
         workspace: Path | None,
     ) -> str:
         start = time.monotonic()
+
+        # Build message with optional audio/image attachments
+        msg = {"role": "user", "content": prompt}
+        if self._pending_attachments:
+            audio_parts = [
+                a for a in self._pending_attachments
+                if a.get("mime_type", "").startswith("audio/")
+            ]
+            image_parts = [
+                a for a in self._pending_attachments
+                if a.get("mime_type", "").startswith("image/")
+            ]
+            if audio_parts:
+                msg["audio"] = audio_parts
+            if image_parts:
+                msg["images"] = image_parts
+
         response = await provider.complete(
-            messages=[{"role": "user", "content": prompt}],
+            messages=[msg],
             system=self.config.personality,
             model=model,
             max_tokens=self.config.max_tokens,
@@ -431,6 +462,7 @@ class SubagentRunner:
             "subagent_response",
             agent=self.config.name,
             content_len=len(response.content),
+            content_preview=response.content[:500],
             duration_ms=elapsed_ms,
         )
         return response.content
