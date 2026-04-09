@@ -288,6 +288,16 @@ class DiscordAdapter(BaseAdapter):
                         for m in recent:
                             tag = "[BOT]" if m.author.bot else "[USER]"
                             content = m.content[:500] if m.content else ""
+                            # Note any image attachments so the bot knows
+                            # images were posted, even if it can't see them
+                            # inline in the history context.
+                            img_atts = [
+                                a for a in m.attachments
+                                if (a.content_type or "").startswith("image/")
+                            ]
+                            if img_atts:
+                                img_note = f" [attached {len(img_atts)} image(s)]"
+                                content = (content or "") + img_note
                             if content:
                                 lines.append(f"{tag} {m.author.display_name}: {content}")
                         if lines:
@@ -321,6 +331,42 @@ class DiscordAdapter(BaseAdapter):
             # Extract attachments: images/audio as binary, text files inlined
             attachments = []
             text_attachments = []
+
+            # If the user replied to a message, pull images from the
+            # referenced message so the bot can see what they're referring to.
+            if message.reference and message.reference.message_id:
+                try:
+                    ref_msg = message.reference.resolved
+                    if ref_msg is None:
+                        ref_msg = await message.channel.fetch_message(
+                            message.reference.message_id
+                        )
+                    if ref_msg and ref_msg.attachments:
+                        for att in ref_msg.attachments:
+                            ct = att.content_type or ""
+                            if ct.startswith("image/"):
+                                try:
+                                    file_bytes = await att.read()
+                                    attachments.append(
+                                        {
+                                            "data": file_bytes,
+                                            "mime_type": ct,
+                                            "filename": att.filename or "",
+                                        }
+                                    )
+                                    log.info(
+                                        "discord_reply_image_extracted",
+                                        filename=att.filename,
+                                        size=len(file_bytes),
+                                    )
+                                except Exception as e:
+                                    log.warning(
+                                        "discord_reply_attachment_failed",
+                                        error=str(e),
+                                    )
+                except Exception as e:
+                    log.warning("discord_reference_fetch_failed", error=str(e))
+
             for attachment in message.attachments:
                 ct = attachment.content_type or ""
                 fname = attachment.filename or ""

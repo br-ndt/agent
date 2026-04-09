@@ -25,6 +25,7 @@ log = structlog.get_logger()
 MAX_HOT = 40  # Messages kept in full detail
 SUMMARIZE_CHUNK = 10  # How many old messages to summarize at once
 SAVE_INTERVAL = 30  # Auto-save every N seconds
+CONVERSATION_GAP = 10 * 60  # Seconds of inactivity before treating as a new conversation
 
 DB_PATH = Path(__file__).resolve().parent.parent / "state" / "sessions.db"
 
@@ -58,15 +59,15 @@ class SessionStore:
             return {"summary": "", "history": [], "message_count": 0}
 
         async with self._db.execute(
-            "SELECT summary, hot_messages, message_count FROM sessions WHERE session_id = ?",
+            "SELECT summary, hot_messages, message_count, last_active FROM sessions WHERE session_id = ?",
             (session_id,),
         ) as cursor:
             row = await cursor.fetchone()
 
         if not row:
-            return {"summary": "", "history": [], "message_count": 0}
+            return {"summary": "", "history": [], "message_count": 0, "last_active": 0.0}
 
-        summary, hot_json, count = row
+        summary, hot_json, count, last_active = row
         try:
             history = json.loads(hot_json)
         except json.JSONDecodeError:
@@ -79,7 +80,7 @@ class SessionStore:
             hot_messages=len(history),
         )
 
-        return {"summary": summary, "history": history, "message_count": count}
+        return {"summary": summary, "history": history, "message_count": count, "last_active": last_active or 0.0}
 
     async def save(
         self, session_id: str, summary: str, history: list[dict], message_count: int
@@ -161,13 +162,34 @@ class PersistentSession:
         self.audio: list[dict] = []
 
     async def ensure_loaded(self):
-        """Lazy-load from DB on first access."""
+        """Lazy-load from DB on first access.
+
+        If the session has been idle longer than CONVERSATION_GAP, evict
+        old history to memory and start a fresh conversation context so
+        stale messages don't confuse the LLM.
+        """
         if self._loaded:
             return
         data = await self.store.load(self.session_id)
         self.history = data["history"]
         self.message_count = data["message_count"]
         self._loaded = True
+
+        # Detect stale sessions and start a fresh conversation
+        last_active = data.get("last_active", 0.0)
+        gap = time.time() - last_active if last_active else 0
+        if gap > CONVERSATION_GAP and self.history:
+            log.info(
+                "session_conversation_boundary",
+                session_id=self.session_id,
+                gap_seconds=int(gap),
+                old_messages=len(self.history),
+            )
+            # Evict everything to memory so it's searchable via <recall>
+            if self.memory_store:
+                await self._evict_to_memory(force_all=True)
+            else:
+                self.history = []
 
     def get_messages_for_llm(self) -> list[dict]:
         """Build the message list the LLM actually sees.
@@ -191,10 +213,14 @@ class PersistentSession:
             self.session_id, "", self.history, self.message_count
         )
 
-    async def _evict_to_memory(self):
+    async def _evict_to_memory(self, force_all: bool = False):
         """Write the oldest messages to the MemoryStore, merging into related topics when possible."""
-        to_evict = self.history[:SUMMARIZE_CHUNK]
-        self.history = self.history[SUMMARIZE_CHUNK:]
+        if force_all:
+            to_evict = self.history
+            self.history = []
+        else:
+            to_evict = self.history[:SUMMARIZE_CHUNK]
+            self.history = self.history[SUMMARIZE_CHUNK:]
 
         try:
             from agent.memory import build_topic_summary_for_index

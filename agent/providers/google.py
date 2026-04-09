@@ -86,6 +86,8 @@ class GoogleProvider(BaseProvider):
         image_bytes_list: list[bytes] = []
         try:
             parts = response.candidates[0].content.parts
+            if not parts:
+                raise AttributeError("parts is None/empty")
             for part in parts:
                 if hasattr(part, "inline_data") and part.inline_data:
                     data = part.inline_data.data

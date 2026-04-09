@@ -134,7 +134,7 @@ class Router:
 
             # Call orchestrator (returns dict with text + images)
             result = await self.orchestrator.handle(
-                session_id=f"{msg.platform}:{msg.sender_id}",
+                session_id=f"{msg.platform}:{msg.chat_id}",
                 user_msg=msg.text,
                 reply_fn=reply_fn,
                 tier=tier,

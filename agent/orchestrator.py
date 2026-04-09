@@ -347,10 +347,10 @@ class Orchestrator:
                     f"- **{agent_name}** (started {elapsed_str}): {info.get('task', '?')[:100]}"
                 )
             result += (
-                "\n\n## Busy Subagents\n"
-                "These subagents are currently working on tasks. Do NOT delegate "
-                "to them — report that they are busy if the user asks for something "
-                "that would require them.\n\n" + "\n".join(busy_lines) + "\n"
+                "\n\n## Currently Busy\n"
+                "These capabilities are occupied with other tasks. Do NOT delegate "
+                "to them — tell the user you're currently busy with something else "
+                "if they ask for something that would require them.\n\n" + "\n".join(busy_lines) + "\n"
             )
 
         return result
@@ -594,6 +594,17 @@ class Orchestrator:
 
             has_ops = bool(delegations or skill_ops or vision_ops or memory_ops or knowledge_ops)
 
+            if has_ops:
+                log.info(
+                    "orchestrator_ops_parsed",
+                    pass_num=pass_num,
+                    delegations=[d["agent"] for d in delegations],
+                    skills=[op.get("name", op.get("type")) for op in skill_ops],
+                    vision=[op["type"] for op in vision_ops],
+                    memory=len(memory_ops),
+                    knowledge=len(knowledge_ops),
+                )
+
             if not has_ops:
                 # No operations — this is the final response
                 final = _strip_thinking(response.content)
@@ -658,8 +669,19 @@ class Orchestrator:
                 pass_results.extend(d_results)
                 generated_images.extend(d_images)
 
-            # ── If only images generated with no text results, return ──
-            if generated_images and not pass_results:
+            # ── If only images generated with no meaningful text, return ──
+            # pass_results always has entries (even for image-only subagents),
+            # so check whether any delegation result contains actual text.
+            d_results_local = d_results if valid_delegations else []
+            has_text_content = any(
+                r.split("Result:\n", 1)[-1].strip() for r in d_results_local
+            )
+            other_results = v_results or s_results or (
+                memory_ops and self.memory_store) or knowledge_ops
+            if generated_images and not has_text_content and not other_results:
+                # The preamble was already sent via reply_fn during
+                # delegation setup — don't return it again or it will
+                # be posted to the channel a second time.
                 await session.add_message("assistant", "")
                 return make_result("", generated_images)
 
@@ -667,7 +689,7 @@ class Orchestrator:
             # Record this pass's response as assistant, results as user
             await session.add_message("assistant", response.content)
 
-            results_msg = "Results from this step:\n\n" + "\n\n---\n\n".join(
+            results_msg = "Your results from this step:\n\n" + "\n\n---\n\n".join(
                 pass_results
             )
             await session.add_message("user", results_msg)
@@ -1092,9 +1114,8 @@ class Orchestrator:
                 if agent_name in self._active_delegations:
                     busy_info = self._active_delegations[agent_name]
                     results.append(
-                        f"[{agent_name}] BUSY: Currently working on a task "
-                        f"for session {busy_info.get('session_id', '?')[:20]}. "
-                        f"Try again when it's done."
+                        f"[{agent_name}] BUSY: You are already working on "
+                        f"another task. Try again when it's done."
                     )
                     log.info(
                         "delegation_skipped_busy",
@@ -1162,7 +1183,7 @@ class Orchestrator:
             self.skills = self.skill_registry.list_active()
             log.info("skills_reloaded_after_sysadmin")
 
-        for d, result in zip(to_run, raw_results):
+        for d, runner, result in zip(to_run, runners_in_order, raw_results):
             if isinstance(result, Exception):
                 results.append(
                     f"[{d['agent']}] ERROR: {type(result).__name__}: {result}"
@@ -1206,7 +1227,20 @@ class Orchestrator:
                     )
                     results.append(f"[{d['agent']}]{media_note} Result:\n{sanitized}")
                 else:
-                    results.append(f"[{d['agent']}] Result:\n{sanitized}")
+                    # Annotate when the subagent generated images, so the
+                    # orchestrator knows images were produced even if the
+                    # text content is empty.
+                    agent_images = getattr(runner, "_last_images", [])
+                    if agent_images:
+                        img_note = (
+                            f" (generated {len(agent_images)} image(s) — "
+                            f"already queued for delivery)"
+                        )
+                        results.append(
+                            f"[{d['agent']}]{img_note} Result:\n{sanitized}"
+                        )
+                    else:
+                        results.append(f"[{d['agent']}] Result:\n{sanitized}")
 
         # Fire-and-forget auto-diagnosis for failures
         has_errors = any(isinstance(r, Exception) for r in raw_results)
@@ -1346,10 +1380,6 @@ def _extract_preamble(response_content: str) -> str:
 
     # Strip thinking tags if present
     preamble = re.sub(r"<thinking>.*?</thinking>", "", preamble, flags=re.DOTALL).strip()
-
-    # Too short to be useful (e.g. just "OK" or empty)
-    if len(preamble) < 10:
-        return ""
 
     return preamble
 
