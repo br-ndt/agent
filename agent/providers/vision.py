@@ -3,6 +3,7 @@
 Extends the Google provider with vision (image understanding) and
 Nano Banana (image generation) capabilities.
 """
+import asyncio
 import base64
 import logging
 from io import BytesIO
@@ -21,11 +22,22 @@ class VisionProvider:
 
     def __init__(self, api_key: str):
         """Initialize vision provider.
-        
+
         Args:
-            api_key: Google API key
+            api_key: Google API key (comma-separated for round-robin)
         """
-        self.client = genai.Client(api_key=api_key)
+        keys = [k.strip() for k in api_key.split(",") if k.strip()]
+        if not keys:
+            raise ValueError("At least one Google API key is required")
+        self._clients = [genai.Client(api_key=k) for k in keys]
+        self._index = 0
+        self.client = self._clients[0]
+
+    def _next_client(self) -> genai.Client:
+        """Round-robin across API key clients."""
+        client = self._clients[self._index % len(self._clients)]
+        self._index += 1
+        return client
         self.vision_model = "gemini-3-flash-preview"  # For image understanding
         self.generation_model = "gemini-3.1-flash-image-preview"  # Nano Banana
         
@@ -66,7 +78,7 @@ class VisionProvider:
             )
 
             # Generate analysis
-            response = self.client.models.generate_content(
+            response = await asyncio.to_thread(self._next_client().models.generate_content,
                 model=self.vision_model,
                 contents=[image_part, prompt]
             )
@@ -106,7 +118,7 @@ class VisionProvider:
             # Add prompt
             parts.append(prompt)
             
-            response = self.client.models.generate_content(
+            response = await asyncio.to_thread(self._next_client().models.generate_content,
                 model=self.vision_model,
                 contents=parts
             )
@@ -145,7 +157,7 @@ class VisionProvider:
             if aspect_ratio != "1:1":
                 enhanced_prompt = f"{prompt} ({aspect_ratio} aspect ratio)"
             
-            response = self.client.models.generate_content(
+            response = await asyncio.to_thread(self._next_client().models.generate_content,
                 model=self.generation_model,
                 contents=enhanced_prompt,
                 config=config
@@ -223,7 +235,7 @@ class VisionProvider:
                 response_modalities=["IMAGE"]
             )
             
-            response = self.client.models.generate_content(
+            response = await asyncio.to_thread(self._next_client().models.generate_content,
                 model=self.generation_model,
                 contents=[image_part, edit_prompt],
                 config=config

@@ -35,6 +35,21 @@ class Router:
         if composite_id in self.config.trusted_ids:
             return "trusted"
 
+        # Bots: trusted_bots get "trusted", remaining other_bots get "bot"
+        if composite_id in self.config.trusted_bots:
+            return "trusted"
+        other_bots = self.config.other_bots
+        if other_bots:
+            if isinstance(other_bots, dict):
+                bot_ids = set(other_bots.keys())
+            else:
+                bot_ids = {str(b) for b in other_bots}
+            if composite_id in bot_ids:
+                return "bot"
+
+        if composite_id in self.config.basic_ids:
+            return "basic"
+
         # CLI is always admin (it's local)
         if msg.platform == "cli":
             return "admin"

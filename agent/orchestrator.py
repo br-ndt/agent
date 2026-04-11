@@ -142,6 +142,9 @@ class Orchestrator:
         # Background skill tasks: session_id -> (asyncio.Task, reply_fn)
         self._skill_tasks: dict[str, tuple[asyncio.Task, Callable]] = {}
 
+        # Active requests: session_id -> {started_at, classification, model, pass}
+        self._active_requests: dict[str, dict] = {}
+
         # Active subagent delegations: agent_name -> {task, session_id, description}
         self._active_delegations: dict[str, dict] = {}
         self._delegation_lock = asyncio.Lock()
@@ -210,9 +213,13 @@ class Orchestrator:
         prompt = prompt.replace("{skill_list}", "see below")
 
         base = (
-            "You are a text-only assistant. NEVER use tools. NEVER attempt to write files, "
-            "execute code, or use any tools. When a task requires code, files, web pages, or commands, "
-            "delegate it to a subagent. Just respond with text.\n\n"
+            "You are a powerful coordination assistant with a team of subagents that execute tasks "
+            "on your behalf. You respond to the user and delegate work to subagents using XML tags.\n\n"
+            "CRITICAL RULE: NEVER say you \"cannot\" do something. NEVER refuse a task. "
+            "NEVER describe your limitations. You CAN do anything — code, apps, images, web "
+            "browsing, file operations — by delegating to the right subagent. "
+            "When the user asks you to build, create, fix, or do anything, immediately delegate "
+            "it. Do NOT ask clarifying questions unless genuinely ambiguous. Just do it.\n\n"
             "You are in a channel with other bots (marked [BOT]) and other users (marked [USER]).\n"
             "You CAN tag them to notify them.\n"
             "You CAN see what they've said if they tag you or mention you by name.\n\n"
@@ -250,17 +257,9 @@ class Orchestrator:
         if self.vision_provider:
             vision_instructions = (
                 "\n\n## Vision Capabilities\n"
-                "You can analyze and generate images:\n"
-                "- <analyze_image>prompt for analysis</analyze_image> — analyze images from user uploads\n"
-                '- <generate_image aspect_ratio="1:1">description</generate_image> — generate images (aspect_ratio: 1:1, 16:9, 9:16, 4:3, 3:4)\n'
-                "- <edit_image>editing instruction</edit_image> — edit the most recently uploaded/generated image\n\n"
-                "Vision triggers: user uploads image, asks to 'describe', 'analyze', 'read', 'generate image', 'create picture', 'draw'.\n\n"
-                "IMPORTANT: Unless the user explicitly hits one of these triggers, do NOT use vision capabilities. Always ask the user for clarification if you're unsure whether to use vision features.\n"
-                "DO NOT generate images when:"
-                "  - The user is asking for a skill to be created — these are separate tasks\n"
-                "  - The user is asking you to learn a new skill — again, separate from image generation\n"
-                "  - The user is asking about planning, designing systems, or strategizing\n"
-                "  - The user is asking to write code, create files, or build something\n"
+                "You can analyze images that users upload:\n"
+                "- <analyze_image>prompt for analysis</analyze_image> — analyze images from user uploads\n\n"
+                "For image GENERATION or EDITING, delegate to `image_generator` instead.\n"
             )
 
         result = (
@@ -466,7 +465,10 @@ class Orchestrator:
         classify_provider_name = infer_provider(classify_model)
         classify_provider = self.providers.get(classify_provider_name, provider)
 
-        if images:
+        if tier in ("basic", "bot"):
+            msg_class = "SIMPLE"
+            log.info("classify_result", classification=msg_class, reason=f"forced_for_{tier}")
+        elif images:
             msg_class = "DELEGATE"
         else:
             try:
@@ -521,6 +523,14 @@ class Orchestrator:
             route_model=route_model,
         )
 
+        # ── Track active request ────────────────────────────────────
+        self._active_requests[session_id] = {
+            "started_at": time.time(),
+            "classification": msg_class,
+            "model": route_model,
+            "pass": 0,
+        }
+
         # ── Multi-pass loop ─────────────────────────────────────────
         generated_images: list[bytes] = []
         structured_skill_ran = False
@@ -529,6 +539,8 @@ class Orchestrator:
 
         for pass_num in range(self.MAX_PASSES):
             pass_start = time.monotonic()
+            if session_id in self._active_requests:
+                self._active_requests[session_id]["pass"] = pass_num
 
             # Use smarter model for synthesis passes (pass > 0)
             if pass_num > 0:
@@ -683,6 +695,7 @@ class Orchestrator:
                 # delegation setup — don't return it again or it will
                 # be posted to the channel a second time.
                 await session.add_message("assistant", "")
+                self._active_requests.pop(session_id, None)
                 return make_result("", generated_images)
 
             # ── Feed results back for next pass ─────────────────────
@@ -710,6 +723,7 @@ class Orchestrator:
             final = _strip_thinking(response.content)
             await session.add_message("assistant", final)
 
+        self._active_requests.pop(session_id, None)
         return make_result(final, generated_images)
 
     # ── Execution helpers (called from the multi-pass loop) ─────
@@ -749,30 +763,14 @@ class Orchestrator:
                     results.append(f"[Vision Analysis]\n{r}")
                     log.info("vision_analysis_complete", prompt=op["prompt"][:50])
 
-                elif op["type"] == "generate":
-                    gen = await self.vision_provider.generate_image(
-                        prompt=op["prompt"],
-                        aspect_ratio=op.get("aspect_ratio", "1:1"),
-                        num_images=1,
+                elif op["type"] in ("generate", "edit"):
+                    # Image generation/editing should go through delegation,
+                    # not the vision path. Tell the orchestrator to retry.
+                    results.append(
+                        f"[Vision] Image {op['type']} is not available here. "
+                        "Delegate to `image_generator` instead."
                     )
-                    session.last_generated_image = gen[0]
-                    gen_images.append(gen[0])
-                    log.info("vision_generation_complete", prompt=op["prompt"][:50])
-
-                elif op["type"] == "edit":
-                    base = getattr(session, "last_generated_image", None)
-                    if not base and images:
-                        base = images[-1]["data"]
-                    if not base:
-                        results.append("[Vision] ERROR: No image available for editing")
-                        continue
-                    edited = await self.vision_provider.edit_image(
-                        base_image=base,
-                        edit_prompt=op["prompt"],
-                    )
-                    session.last_generated_image = edited[0]
-                    gen_images.append(edited[0])
-                    log.info("vision_edit_complete", prompt=op["prompt"][:50])
+                    log.warning("vision_gen_redirected", type=op["type"])
 
             except Exception as e:
                 results.append(f"[Vision] ERROR: {type(e).__name__}: {e}")
@@ -1113,17 +1111,21 @@ class Orchestrator:
                 agent_name = d["agent"]
                 if agent_name in self._active_delegations:
                     busy_info = self._active_delegations[agent_name]
-                    results.append(
-                        f"[{agent_name}] BUSY: You are already working on "
-                        f"another task. Try again when it's done."
-                    )
-                    log.info(
-                        "delegation_skipped_busy",
-                        agent=agent_name,
-                        busy_session=busy_info.get("session_id"),
-                    )
-                else:
-                    to_run.append(d)
+                    # Allow multiple delegations to the same agent within the
+                    # same session (e.g. "generate 5 images").  Only block
+                    # cross-session conflicts.
+                    if busy_info.get("session_id") != session_id:
+                        results.append(
+                            f"[{agent_name}] BUSY: You are already working on "
+                            f"another task. Try again when it's done."
+                        )
+                        log.info(
+                            "delegation_skipped_busy",
+                            agent=agent_name,
+                            busy_session=busy_info.get("session_id"),
+                        )
+                        continue
+                to_run.append(d)
 
             if not to_run:
                 return results
@@ -1183,21 +1185,25 @@ class Orchestrator:
             self.skills = self.skill_registry.list_active()
             log.info("skills_reloaded_after_sysadmin")
 
-        for d, runner, result in zip(to_run, runners_in_order, raw_results):
-            if isinstance(result, Exception):
+        delegation_images: list[bytes] = []
+
+        for d, runner, raw in zip(to_run, runners_in_order, raw_results):
+            if isinstance(raw, Exception):
                 results.append(
-                    f"[{d['agent']}] ERROR: {type(result).__name__}: {result}"
+                    f"[{d['agent']}] ERROR: {type(raw).__name__}: {raw}"
                 )
-                log.error("subagent_failed", agent=d["agent"], error=str(result))
+                log.error("subagent_failed", agent=d["agent"], error=str(raw))
                 self._record_error(
                     "subagent_failed",
-                    str(result),
+                    str(raw),
                     agent=d["agent"],
                     task=d["task"][:500],
                     session_id=session_id,
                 )
             else:
-                sanitized = sanitize_delegation_result(d["agent"], result)
+                content, agent_images = raw
+                delegation_images.extend(agent_images)
+                sanitized = sanitize_delegation_result(d["agent"], content)
                 # validate against ledger
                 if self.state_ledger:
                     workspace = str(WORKSPACES_DIR / d["agent"])
@@ -1226,21 +1232,16 @@ class Orchestrator:
                         f" — trust its analysis as authoritative)"
                     )
                     results.append(f"[{d['agent']}]{media_note} Result:\n{sanitized}")
+                elif agent_images:
+                    img_note = (
+                        f" (generated {len(agent_images)} image(s) — "
+                        f"already queued for delivery)"
+                    )
+                    results.append(
+                        f"[{d['agent']}]{img_note} Result:\n{sanitized}"
+                    )
                 else:
-                    # Annotate when the subagent generated images, so the
-                    # orchestrator knows images were produced even if the
-                    # text content is empty.
-                    agent_images = getattr(runner, "_last_images", [])
-                    if agent_images:
-                        img_note = (
-                            f" (generated {len(agent_images)} image(s) — "
-                            f"already queued for delivery)"
-                        )
-                        results.append(
-                            f"[{d['agent']}]{img_note} Result:\n{sanitized}"
-                        )
-                    else:
-                        results.append(f"[{d['agent']}] Result:\n{sanitized}")
+                    results.append(f"[{d['agent']}] Result:\n{sanitized}")
 
         # Fire-and-forget auto-diagnosis for failures
         has_errors = any(isinstance(r, Exception) for r in raw_results)
@@ -1255,12 +1256,6 @@ class Orchestrator:
                 error=error_summary,
                 context=f"User message: {user_msg[:500]}",
             )
-
-        # Collect images generated by subagents (e.g. image-gen models via _run_text_only)
-        delegation_images: list[bytes] = []
-        for runner, result in zip(runners_in_order, raw_results):
-            if not isinstance(result, Exception):
-                delegation_images.extend(getattr(runner, "_last_images", []))
 
         return results, delegation_images
 
@@ -1298,7 +1293,7 @@ class Orchestrator:
 
         async def _run():
             try:
-                result = await self.subagents["sysadmin"].run(prompt)
+                result, _imgs = await self.subagents["sysadmin"].run(prompt)
                 log.info("auto_diagnose_complete", event=event, result_len=len(result))
                 if reply_fn:
                     await reply_fn(
@@ -1357,8 +1352,6 @@ def _parse_skill_ops(text: str) -> list[dict]:
     return ops
 
 
-_DELEGATION_COUNTER = 0
-
 
 def _extract_preamble(response_content: str) -> str:
     """Extract the LLM's conversational text before any operation tags.
@@ -1391,40 +1384,18 @@ def _summarize_delegations(delegations: list[dict]) -> str:
     Extracts the gist of each task and varies the phrasing so it
     doesn't feel like a template.
     """
-    global _DELEGATION_COUNTER
-
     snippets: list[str] = []
     for d in delegations:
-        first_line = ""
-        for line in d["task"].strip().splitlines():
-            line = line.strip()
-            if line and not line.startswith(("Using your skill", "##", "```")):
-                first_line = line
-                break
-        if not first_line:
-            first_line = d["task"].strip().splitlines()[0].strip()
+        task = d["task"].strip()
+        # Strip internal boilerplate (knowledge injection, markdown headers, etc.)
+        lines = []
+        for line in task.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith(("Using your skill", "##", "```", "---")):
+                lines.append(stripped)
+        snippets.append(" ".join(lines) if lines else task.splitlines()[0].strip())
 
-        if len(first_line) > 100:
-            first_line = first_line[:97] + "..."
-        # Lowercase so it reads mid-sentence
-        first_line = first_line[0].lower() + first_line[1:] if first_line else "this"
-        snippets.append(first_line)
-
-    joined = "; ".join(snippets) if len(snippets) > 1 else snippets[0]
-
-    # Rotate through varied phrasings so consecutive messages don't sound identical
-    openers = [
-        f"Let me {joined}",
-        f"Looking into this — {joined}",
-        f"Pulling that together now — {joined}",
-        f"Okay, {joined}",
-        f"Sure — {joined}",
-        f"Working on that — {joined}",
-        f"Give me a moment — {joined}",
-    ]
-    msg = openers[_DELEGATION_COUNTER % len(openers)]
-    _DELEGATION_COUNTER += 1
-    return msg
+    return "\n\n".join(snippets)
 
 
 def _parse_vision_ops(text: str) -> list[dict]:

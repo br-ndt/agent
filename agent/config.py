@@ -7,7 +7,9 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-load_dotenv()
+def init_dotenv(env_path: str | None = None):
+    """Load .env file. Called once at startup."""
+    load_dotenv(env_path)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -64,7 +66,7 @@ class Config:
     # LLM keys
     anthropic_api_key: str = ""
     openai_api_key: str = ""
-    google_api_key: str = ""
+    google_api_key: str = ""       # comma-separated for multiple keys
 
     # Chat adapters
     telegram_bot_token: str = ""
@@ -74,6 +76,8 @@ class Config:
     # Access control
     admin_ids: set[str] = field(default_factory=set)
     trusted_ids: set[str] = field(default_factory=set)
+    basic_ids: set[str] = field(default_factory=set)
+    trusted_bots: set[str] = field(default_factory=set)
 
     # Tier-based routing: tier -> {model, provider (optional)}
     tier_routing: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -94,6 +98,7 @@ class Config:
     # Services
     status_port: int = 8765
     log_level: str = "INFO"
+    state_dir: str = ""            # override state directory; default: <repo>/state/
 
     @property
     def orchestrator_provider(self) -> str:
@@ -163,6 +168,10 @@ def _apply_yaml(cfg: Config, raw: dict):
         cfg.admin_ids.add(aid)
     for tid in raw.get("access", {}).get("trusted_ids", []) or []:
         cfg.trusted_ids.add(tid)
+    for bid in raw.get("access", {}).get("basic_ids", []) or []:
+        cfg.basic_ids.add(bid)
+    for tb in raw.get("access", {}).get("trusted_bots", []) or []:
+        cfg.trusted_bots.add(tb)
     for tier, routing in raw.get("access", {}).get("tier_routing", {}).items():
         if tier and routing:
             model = routing.get("model", cfg.orchestrator_model)
@@ -170,6 +179,10 @@ def _apply_yaml(cfg: Config, raw: dict):
             provider = routing.get("provider") or infer_provider(model)
             cfg.tier_routing[tier] = {"provider": provider, "model": model}
     cfg.other_bots = raw.get("access", {}).get("other_bots", {}) or {}
+
+    # State directory override
+    cfg.state_dir = raw.get("state_dir", cfg.state_dir)
+    cfg.status_port = raw.get("status_port", cfg.status_port)
 
 
 def _apply_defaults(cfg: Config):

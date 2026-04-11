@@ -827,7 +827,7 @@ class SkillExecutor:
         )
 
         try:
-            result = await subagent_runner.run(prompt, context="")
+            result, _imgs = await subagent_runner.run(prompt, context="")
             run.step_results.append(
                 StepResult(
                     step_id="main",
@@ -875,7 +875,7 @@ class SkillExecutor:
             context_block = "\n".join(prior_outputs)
             prompt = f"## Prior Step Results\n{context_block}\n\n{prompt}"
 
-        result = await subagent_runner.run(prompt, context=task_context)
+        result, _imgs = await subagent_runner.run(prompt, context=task_context)
 
         # Heuristic: if the subagent reports an error, mark as failed
         lower = result.lower()
@@ -913,7 +913,7 @@ class SkillExecutor:
         if skill.content:
             prompt = f"## Skill Reference\n{skill.content}\n\n{prompt}"
 
-        result = await subagent_runner.run(prompt, context=task_context)
+        result, _imgs = await subagent_runner.run(prompt, context=task_context)
 
         # Detect when the step ran but its output indicates nothing was accomplished.
         # Uses "no_op" (not "failed") so on_failure:abort doesn't kill the run —

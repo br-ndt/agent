@@ -17,13 +17,18 @@ to your VPN/tailnet. The OCI security list controls who can reach it.
 """
 
 import asyncio
+import json
+import os
+import secrets
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from aiohttp import web
 import structlog
 
 from agent.cost_tracker import CostTracker
+from agent.diagnostics import ErrorJournal
 
 log = structlog.get_logger()
 
@@ -44,6 +49,51 @@ _alert_channel_id: str | None = None  # Discord channel for alerts
 _alerted_providers: set[str] = set()
 
 HEALTH_CHECK_INTERVAL = 60  # seconds
+
+# ── OBJ export API key ──────────────────────────────────────────────
+_EXPORT_KEY_FILE = Path(__file__).parent / "export_key.txt"
+_export_api_key: str = ""
+
+# Cloister HTML files live in the coder workspace
+_CLOISTER_HTML_DIR = Path("/home/ubuntu/agent/workspaces/coder/cloister/public")
+
+
+def _load_or_create_export_key() -> str:
+    """Load the export API key.
+
+    Priority:
+      1. CLOISTER_API_KEY environment variable — preferred for external access.
+      2. export_key.txt on disk — fallback; a new key is generated if missing.
+
+    Logs a warning when the env var is absent so operators know to set it.
+    """
+    global _export_api_key
+
+    env_key = os.environ.get("CLOISTER_API_KEY", "").strip()
+    if env_key:
+        _export_api_key = env_key
+        print(
+            "[status_server] CLOISTER_API_KEY loaded from environment variable.",
+            flush=True,
+        )
+        return env_key
+
+    # Env var not set — warn and fall back to file-based key.
+    print(
+        "[status_server] WARNING: CLOISTER_API_KEY env var not set. "
+        "Falling back to file-based key. Set CLOISTER_API_KEY for external access.",
+        flush=True,
+    )
+    if _EXPORT_KEY_FILE.exists():
+        key = _EXPORT_KEY_FILE.read_text().strip()
+        if key:
+            _export_api_key = key
+            return key
+    # Generate a fresh 32-char hex key and persist it.
+    key = secrets.token_hex(16)  # 16 bytes = 32 hex chars
+    _EXPORT_KEY_FILE.write_text(key + "\n")
+    _export_api_key = key
+    return key
 
 
 def configure(router, orchestrator, providers, config, cost_tracker=None):
@@ -359,6 +409,11 @@ def _gather_stats() -> dict:
                 skill_status = _orchestrator.skill_executor.get_status(sid)
                 activity["skill"] = skill_status or "running"
 
+            # Active request (orchestrator is processing this session)
+            active_req = _orchestrator._active_requests.get(sid)
+            if active_req:
+                activity["active_request"] = active_req
+
             # Pending results waiting to be delivered
             pending = _orchestrator._pending_results.get(sid, [])
             if pending:
@@ -411,10 +466,24 @@ def _gather_skill_history() -> list[dict]:
 
 
 async def handle_index(request):
-    """HTML status dashboard."""
+    """HTML status dashboard with tabbed layout."""
     stats = _gather_stats()
     skill_runs = _gather_skill_history()
-    now = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Pre-fetch journal data so it's embedded in the page (no AJAX needed for initial load)
+    try:
+        journal = getattr(_orchestrator, "error_journal", None) if _orchestrator else None
+        if journal is None:
+            journal = ErrorJournal()
+        journal_data = journal.query(page=1, per_page=50)
+        archive_list = journal.list_archives()
+    except Exception:
+        journal_data = {"entries": [], "total": 0, "page": 1, "per_page": 50,
+                        "pages": 0, "levels": [], "events": []}
+        archive_list = []
+    journal_json = json.dumps(journal_data)
+    archive_list_json = json.dumps(archive_list)
 
     # Build provider rows
     provider_rows = ""
@@ -422,10 +491,9 @@ async def handle_index(request):
         health = info.get("health", {})
         health_status = health.get("status", "unknown")
         latency = health.get("latency_ms", "—")
-        error = health.get("error", "")
         last_check = health.get("last_check", "—")
         if last_check != "—":
-            last_check = last_check[11:19]  # Just the time portion
+            last_check = f'<span class="local-time" data-utc="{last_check}">{last_check[11:19]}</span>'
 
         if health_status == "ok":
             status_badge = '<span class="badge ok">OK</span>'
@@ -487,13 +555,19 @@ async def handle_index(request):
         sid = sa["session_id"]
         msg_count = sa.get("messages", 0)
 
-        # Determine status and details
         if "skill" in sa:
             status_badge = '<span class="badge unknown">SKILL</span>'
-            # Extract skill name and step from status string
             detail = sa["skill"]
             if len(detail) > 120:
                 detail = detail[:120] + "..."
+        elif sa.get("active_request"):
+            req = sa["active_request"]
+            elapsed = int(time.time() - req.get("started_at", time.time()))
+            cls = req.get("classification", "?")
+            mdl = req.get("model", "?")
+            p = req.get("pass", 0)
+            status_badge = f'<span class="badge auth">{cls}</span>'
+            detail = f"{mdl} — pass {p + 1}, {elapsed}s"
         elif sa.get("pending_results"):
             status_badge = '<span class="badge ok">DONE</span>'
             detail = f"{sa['pending_results']} result(s) waiting"
@@ -509,7 +583,6 @@ async def handle_index(request):
             <td class="dim">{detail}</td>
         </tr>"""
 
-    # Add busy agent rows
     for agent_name, info in busy_agents.items():
         task_preview = info.get("task", "?")
         if len(task_preview) > 100:
@@ -553,10 +626,9 @@ async def handle_index(request):
     if not run_rows:
         run_rows = '<tr><td colspan="4" class="dim">No runs recorded yet</td></tr>'
 
-    # Session info
+    # Summary stats
     session_count = stats.get("sessions", {}).get("active", 0)
 
-    # Overall status
     any_unhealthy = any(
         info.get("health", {}).get("status", "ok") != "ok"
         for info in stats.get("providers", {}).values()
@@ -579,7 +651,6 @@ async def handle_index(request):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent Status</title>
-<meta http-equiv="refresh" content="30">
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@300;400;600;700&display=swap');
 
@@ -616,7 +687,7 @@ async def handle_index(request):
     display: flex;
     align-items: baseline;
     gap: 1rem;
-    margin-bottom: 2rem;
+    margin-bottom: 1.5rem;
     padding-bottom: 1.5rem;
     border-bottom: 1px solid var(--border);
   }}
@@ -643,19 +714,43 @@ async def handle_index(request):
     letter-spacing: 0.05em;
   }}
 
-  .header .overall.ok {{
-    background: var(--green-bg);
-    color: var(--green);
+  .header .overall.ok {{ background: var(--green-bg); color: var(--green); }}
+  .header .overall.error {{ background: var(--red-bg); color: var(--red); }}
+
+  /* ── Tabs ─────────────────────────────────────────────── */
+  .tab-bar {{
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 1.5rem;
   }}
 
-  .header .overall.error {{
-    background: var(--red-bg);
-    color: var(--red);
+  .tab-btn {{
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-family: 'Outfit', sans-serif;
+    font-size: 0.8125rem;
+    font-weight: 400;
+    padding: 0.6rem 1.25rem;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
   }}
 
-  .section {{
-    margin-bottom: 2rem;
+  .tab-btn:hover {{ color: var(--text); }}
+
+  .tab-btn.active {{
+    color: var(--blue);
+    border-bottom-color: var(--blue);
+    font-weight: 600;
   }}
+
+  .tab-panel {{ display: none; }}
+  .tab-panel.active {{ display: block; }}
+
+  /* ── Shared ───────────────────────────────────────────── */
+  .section {{ margin-bottom: 2rem; }}
 
   .section h2 {{
     font-size: 0.75rem;
@@ -696,18 +791,14 @@ async def handle_index(request):
     border-bottom: 1px solid var(--border);
   }}
 
-  tr:last-child td {{
-    border-bottom: none;
-  }}
+  tr:last-child td {{ border-bottom: none; }}
 
   .mono {{
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.8125rem;
   }}
 
-  .dim {{
-    color: var(--text-dim);
-  }}
+  .dim {{ color: var(--text-dim); }}
 
   .badge {{
     display: inline-block;
@@ -719,31 +810,19 @@ async def handle_index(request):
     letter-spacing: 0.05em;
   }}
 
-  .badge.ok {{
-    background: var(--green-bg);
-    color: var(--green);
-  }}
-
-  .badge.error {{
-    background: var(--red-bg);
-    color: var(--red);
-  }}
-
-  .badge.auth {{
-    background: var(--orange-bg);
-    color: var(--orange);
-  }}
-
-  .badge.unknown {{
-    background: rgba(139, 148, 158, 0.1);
-    color: var(--text-dim);
-  }}
+  .badge.ok      {{ background: var(--green-bg);  color: var(--green); }}
+  .badge.error   {{ background: var(--red-bg);    color: var(--red); }}
+  .badge.auth    {{ background: var(--orange-bg);  color: var(--orange); }}
+  .badge.unknown {{ background: rgba(139,148,158,0.1); color: var(--text-dim); }}
+  .badge.debug   {{ background: rgba(139,148,158,0.1); color: var(--text-dim); }}
+  .badge.info    {{ background: rgba(88,166,255,0.1);  color: var(--blue); }}
+  .badge.warning {{ background: var(--orange-bg);  color: var(--orange); }}
 
   .stats-row {{
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: 1rem;
-    margin-bottom: 2rem;
+    margin-bottom: 1.5rem;
   }}
 
   .stat-card {{
@@ -767,8 +846,8 @@ async def handle_index(request):
     font-weight: 600;
   }}
 
-  .stat-card .value.green {{ color: var(--green); }}
-  .stat-card .value.blue {{ color: var(--blue); }}
+  .stat-card .value.green  {{ color: var(--green); }}
+  .stat-card .value.blue   {{ color: var(--blue); }}
   .stat-card .value.purple {{ color: var(--purple); }}
 
   .footer {{
@@ -777,6 +856,199 @@ async def handle_index(request):
     font-size: 0.75rem;
     padding-top: 1rem;
     border-top: 1px solid var(--border);
+  }}
+
+  /* ── Journal ──────────────────────────────────────────── */
+  .journal-filters {{
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.75rem;
+    align-items: center;
+  }}
+
+  .journal-filters select {{
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.3rem 0.5rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+  }}
+
+  .journal-filters select:focus {{
+    outline: none;
+    border-color: var(--blue);
+  }}
+
+  .journal-filters label {{
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }}
+
+  .journal-scroll {{
+    max-height: 520px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }}
+
+  .journal-scroll::-webkit-scrollbar {{ width: 6px; }}
+  .journal-scroll::-webkit-scrollbar-track {{ background: transparent; }}
+  .journal-scroll::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
+
+  .journal-entry {{
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8125rem;
+    display: grid;
+    grid-template-columns: 6.5rem 10rem 1fr;
+    gap: 0.75rem;
+    align-items: start;
+  }}
+
+  .journal-entry:last-child {{ border-bottom: none; }}
+
+  .journal-entry .je-ts {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }}
+
+  .journal-entry .je-event {{
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--blue);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+
+  .journal-entry .je-msg {{
+    color: var(--text);
+    word-break: break-word;
+  }}
+
+  .journal-entry .je-ctx {{
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    margin-top: 0.15rem;
+  }}
+
+  .journal-pager {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.75rem;
+    color: var(--text-dim);
+  }}
+
+  .journal-pager button {{
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    cursor: pointer;
+  }}
+
+  .journal-pager button:disabled {{
+    opacity: 0.3;
+    cursor: default;
+  }}
+
+  .journal-empty {{
+    padding: 1.5rem;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.8125rem;
+  }}
+
+  /* ── Mobile ──────────────────────────────────────────── */
+  @media (max-width: 640px) {{
+    body {{
+      padding: 1rem 0.75rem;
+    }}
+
+    .header {{
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }}
+
+    .header h1 {{ font-size: 1.2rem; }}
+
+    .header .overall {{
+      margin-left: 0;
+    }}
+
+    .tab-bar {{
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }}
+
+    .tab-btn {{
+      padding: 0.5rem 0.75rem;
+      font-size: 0.75rem;
+      white-space: nowrap;
+    }}
+
+    .stats-row {{
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.5rem;
+    }}
+
+    .stat-card {{ padding: 0.75rem; }}
+    .stat-card .value {{ font-size: 1.25rem; }}
+
+    /* Make tables horizontally scrollable */
+    .card {{
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }}
+
+    table {{ font-size: 0.75rem; }}
+    th, td {{ padding: 0.4rem 0.5rem; }}
+    .mono {{ font-size: 0.7rem; }}
+
+    /* Journal entries: stack vertically on mobile */
+    .journal-entry {{
+      grid-template-columns: 1fr;
+      gap: 0.25rem;
+      padding: 0.5rem 0.75rem;
+    }}
+
+    .journal-entry .je-ts {{
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }}
+
+    .journal-entry .je-event {{
+      white-space: normal;
+    }}
+
+    .journal-filters {{
+      gap: 0.35rem;
+    }}
+
+    .journal-filters select {{
+      font-size: 0.7rem;
+      padding: 0.25rem 0.35rem;
+    }}
+
+    .journal-pager {{
+      gap: 0.5rem;
+      font-size: 0.7rem;
+    }}
   }}
 </style>
 </head>
@@ -787,6 +1059,17 @@ async def handle_index(request):
   <span class="uptime">up {stats['uptime']}</span>
   <span class="overall {overall_class}">{overall_text}</span>{quiet_badge}
 </div>
+
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchTab('overview')">Overview</button>
+  <button class="tab-btn" onclick="switchTab('skills')">Skill Runs</button>
+  <button class="tab-btn" onclick="switchTab('journal')">Journal</button>
+  <button class="tab-btn" onclick="switchTab('infra')">Infrastructure</button>
+</div>
+
+<!-- Tab 1: Overview ──────────────────────────────────── -->
+<div class="tab-panel active" id="tab-overview">
 
 <div class="stats-row">
   <div class="stat-card">
@@ -816,6 +1099,66 @@ async def handle_index(request):
     </table>
   </div>
 </div>
+
+</div>
+
+<!-- Tab 2: Skill Runs ────────────────────────────────── -->
+<div class="tab-panel" id="tab-skills">
+
+<div class="section">
+  <h2>Recent Skill Runs</h2>
+  <div class="card">
+    <table>
+      <tr><th>Skill</th><th>Status</th><th>Time</th><th>Error</th></tr>
+      {run_rows}
+    </table>
+  </div>
+</div>
+
+</div>
+
+<!-- Tab 3: Journal ───────────────────────────────────── -->
+<div class="tab-panel" id="tab-journal">
+
+<div class="journal-filters">
+  <label>Source</label>
+  <select id="jf-source" onchange="switchJournalSource()">
+    <option value="">Live</option>
+  </select>
+  <label>Level</label>
+  <select id="jf-level" onchange="loadJournal(1)">
+    <option value="">All</option>
+    <option value="error">error</option>
+    <option value="warning">warning</option>
+    <option value="info">info</option>
+    <option value="debug">debug</option>
+  </select>
+  <label>Event</label>
+  <select id="jf-event" onchange="loadJournal(1)">
+    <option value="">All</option>
+  </select>
+  <label>Per page</label>
+  <select id="jf-perpage" onchange="loadJournal(1)">
+    <option value="25">25</option>
+    <option value="50" selected>50</option>
+    <option value="100">100</option>
+  </select>
+</div>
+<div class="card">
+  <div class="journal-scroll" id="journal-scroll">
+    <div class="journal-empty">Select the Journal tab to load entries.</div>
+  </div>
+  <div class="journal-pager" id="journal-pager" style="display:none">
+    <button id="jp-prev" onclick="loadJournal(currentPage-1)">&laquo; Prev</button>
+    <span id="jp-info"></span>
+    <button id="jp-next" onclick="loadJournal(currentPage+1)">Next &raquo;</button>
+  </div>
+</div>
+
+</div>
+
+<!-- Tab 4: Infrastructure ────────────────────────────── -->
+<div class="tab-panel" id="tab-infra">
 
 <div class="section">
   <h2>Providers</h2>
@@ -847,19 +1190,192 @@ async def handle_index(request):
   </div>
 </div>
 
-<div class="section">
-  <h2>Recent Skill Runs</h2>
-  <div class="card">
-    <table>
-      <tr><th>Skill</th><th>Status</th><th>Time</th><th>Error</th></tr>
-      {run_rows}
-    </table>
-  </div>
 </div>
 
 <div class="footer">
-  Auto-refreshes every 30s · {now}
+  <span class="local-time" data-utc="{now}">{now}</span>
 </div>
+
+<script>
+var _journalBootstrap = {journal_json};
+var _archiveList = {archive_list_json};
+</script>
+<script>
+// Convert all UTC timestamps to browser-local time
+document.querySelectorAll('.local-time').forEach(function(el) {{
+  try {{
+    var d = new Date(el.dataset.utc);
+    if (!isNaN(d)) el.textContent = d.toLocaleString();
+  }} catch(_) {{}}
+}});
+</script>
+<script>
+(function() {{
+  var currentPage = 1;
+  window.currentPage = currentPage;
+  var knownEvents = new Set();
+  var tabNames = ['overview', 'skills', 'journal', 'infra'];
+  var activeTab = 'overview';
+  var activeSource = '';  // '' = live, 'filename.jsonl' = archive
+
+  /* ── Populate archive dropdown ─────────────────────── */
+  (function() {{
+    var sel = document.getElementById('jf-source');
+    (_archiveList || []).forEach(function(a) {{
+      var opt = document.createElement('option');
+      opt.value = a.filename;
+      opt.textContent = a.date + ' (' + a.lines + ' entries)';
+      sel.appendChild(opt);
+    }});
+  }})();
+
+  function switchJournalSource() {{
+    activeSource = document.getElementById('jf-source').value;
+    // Reset event filter since archive may have different events
+    var evSel = document.getElementById('jf-event');
+    evSel.innerHTML = '<option value="">All</option>';
+    knownEvents = new Set();
+    loadJournal(1);
+  }}
+  window.switchJournalSource = switchJournalSource;
+
+  /* ── Tab switching ──────────────────────────────────── */
+  function switchTab(id) {{
+    activeTab = id;
+    location.hash = id;
+    document.querySelectorAll('.tab-panel').forEach(function(p) {{
+      p.classList.remove('active');
+    }});
+    document.querySelectorAll('.tab-btn').forEach(function(b) {{
+      b.classList.remove('active');
+    }});
+    var panel = document.getElementById('tab-' + id);
+    if (panel) panel.classList.add('active');
+    var btns = document.querySelectorAll('.tab-btn');
+    for (var i = 0; i < tabNames.length; i++) {{
+      if (tabNames[i] === id && btns[i]) btns[i].classList.add('active');
+    }}
+    if (id === 'journal' && !activeSource) {{
+      renderJournal(window._journalBootstrap || {{}});
+    }}
+  }}
+  window.switchTab = switchTab;
+
+  // Restore tab from URL hash on load
+  var hash = location.hash.replace('#', '');
+  if (hash && tabNames.indexOf(hash) !== -1) {{
+    switchTab(hash);
+  }}
+
+  // Auto-reload every 60s, skip when on journal tab
+  setInterval(function() {{
+    if (activeTab !== 'journal') location.reload();
+  }}, 60000);
+
+  /* ── Journal rendering ─────────────────────────────── */
+  function levelBadge(level) {{
+    var cls = {{'error':'error','warning':'warning','info':'info','debug':'debug'}}[level] || 'unknown';
+    return '<span class="badge ' + cls + '">' + (level || 'error').toUpperCase() + '</span>';
+  }}
+
+  function esc(s) {{
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }}
+
+  function renderJournal(data) {{
+    // Populate event dropdown
+    var evSel = document.getElementById('jf-event');
+    (data.events || []).forEach(function(ev) {{
+      if (!knownEvents.has(ev)) {{
+        knownEvents.add(ev);
+        var opt = document.createElement('option');
+        opt.value = ev;
+        opt.textContent = ev;
+        evSel.appendChild(opt);
+      }}
+    }});
+
+    var scroll = document.getElementById('journal-scroll');
+    if (!data.entries || data.entries.length === 0) {{
+      scroll.innerHTML = '<div class="journal-empty">No journal entries match the current filters.</div>';
+      document.getElementById('journal-pager').style.display = 'none';
+      return;
+    }}
+
+    var html = '';
+    data.entries.forEach(function(e) {{
+      var tsRaw = e.ts || '';
+      var ts = tsRaw;
+      try {{
+        var d = new Date(tsRaw);
+        ts = d.toLocaleTimeString('en-US', {{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}});
+      }} catch(_) {{ ts = tsRaw.substring(11,19); }}
+      var ev = e.event || 'unknown';
+      var msg = e.error || '';
+      var ctx = [];
+      Object.keys(e).forEach(function(k) {{
+        if (k !== 'ts' && k !== 'level' && k !== 'event' && k !== 'error')
+          ctx.push(k + '=' + String(e[k]).substring(0, 80));
+      }});
+      var ctxHtml = ctx.length
+        ? '<div class="je-ctx">' + esc(ctx.join('  ')) + '</div>' : '';
+      html += '<div class="journal-entry">'
+        + '<span class="je-ts">' + levelBadge(e.level) + ' ' + esc(ts) + '</span>'
+        + '<span class="je-event" title="' + esc(ev) + '">' + esc(ev) + '</span>'
+        + '<span class="je-msg">'
+        + esc(msg.length > 300 ? msg.substring(0, 300) + '\u2026' : msg)
+        + ctxHtml + '</span></div>';
+    }});
+    scroll.innerHTML = html;
+    scroll.scrollTop = 0;
+
+    var pager = document.getElementById('journal-pager');
+    pager.style.display = 'flex';
+    document.getElementById('jp-info').textContent =
+      'Page ' + data.page + ' / ' + data.pages + '  (' + data.total + ' entries)';
+    document.getElementById('jp-prev').disabled = (data.page <= 1);
+    document.getElementById('jp-next').disabled = (data.page >= data.pages);
+  }}
+
+  function loadJournal(page) {{
+    page = page || 1;
+    currentPage = page;
+    window.currentPage = page;
+    var level  = document.getElementById('jf-level').value;
+    var event  = document.getElementById('jf-event').value;
+    var perPg  = document.getElementById('jf-perpage').value;
+    var qs = '?page=' + page + '&per_page=' + perPg;
+    if (level) qs += '&level=' + encodeURIComponent(level);
+    if (event) qs += '&event=' + encodeURIComponent(event);
+
+    var url = activeSource
+      ? '/journal/archive/' + encodeURIComponent(activeSource) + qs
+      : '/journal' + qs;
+
+    var scroll = document.getElementById('journal-scroll');
+    scroll.innerHTML = '<div class="journal-empty">Loading\u2026</div>';
+
+    fetch(url)
+      .then(function(r) {{
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text();
+      }})
+      .then(function(text) {{
+        if (!text) throw new Error('Empty response from server');
+        var data = JSON.parse(text);
+        window._journalBootstrap = data;
+        renderJournal(data);
+      }})
+      .catch(function(err) {{
+        scroll.innerHTML = '<div class="journal-empty">Failed to load: ' + esc(String(err)) + '</div>';
+        document.getElementById('journal-pager').style.display = 'none';
+      }});
+  }}
+  window.loadJournal = loadJournal;
+}})();
+</script>
 
 </body>
 </html>"""
@@ -913,9 +1429,151 @@ async def handle_skills(request):
     )
 
 
+async def handle_cloister(request):
+    """Serve the arcanotech cloister Three.js scene."""
+    html_path = _CLOISTER_HTML_DIR / "cloister.html"
+    try:
+        html = html_path.read_text(encoding="utf-8")
+        return web.Response(text=html, content_type="text/html")
+    except FileNotFoundError:
+        return web.Response(text="<h1>cloister not found</h1>", content_type="text/html", status=404)
+
+
+async def handle_exports(request):
+    """Serve the geometry exporter page (bird + cat OBJ download)."""
+    html_path = _CLOISTER_HTML_DIR / "exports.html"
+    try:
+        html = html_path.read_text(encoding="utf-8")
+        return web.Response(text=html, content_type="text/html")
+    except FileNotFoundError:
+        return web.Response(text="<h1>exports.html not found</h1>", content_type="text/html", status=404)
+
+
+def _check_export_auth(request) -> bool:
+    """Return True if the request carries the correct export API key."""
+    # Check ?key= query param
+    key_param = request.query.get("key", "")
+    if key_param and key_param == _export_api_key:
+        return True
+    # Check Authorization: Bearer <key> header
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ") and auth_header[7:] == _export_api_key:
+        return True
+    return False
+
+
+async def handle_export_bird(request):
+    """Return bird.obj geometry; requires API key."""
+    if not _check_export_auth(request):
+        return web.Response(
+            status=401,
+            text="401 Unauthorized — provide ?key=<api_key> or Authorization: Bearer <api_key>",
+        )
+    from agent.obj_export import generate_bird_obj
+    obj_text = generate_bird_obj()
+    return web.Response(
+        body=obj_text.encode("utf-8"),
+        content_type="application/octet-stream",
+        headers={"Content-Disposition": 'attachment; filename="bird.obj"'},
+    )
+
+
+async def handle_export_cat(request):
+    """Return cat.obj geometry; requires API key."""
+    if not _check_export_auth(request):
+        return web.Response(
+            status=401,
+            text="401 Unauthorized — provide ?key=<api_key> or Authorization: Bearer <api_key>",
+        )
+    from agent.obj_export import generate_cat_obj
+    obj_text = generate_cat_obj()
+    return web.Response(
+        body=obj_text.encode("utf-8"),
+        content_type="application/octet-stream",
+        headers={"Content-Disposition": 'attachment; filename="cat.obj"'},
+    )
+
+
+async def handle_journal(request):
+    """Journal entries with filtering and pagination (JSON API)."""
+    try:
+        journal = getattr(_orchestrator, "error_journal", None) if _orchestrator else None
+        if journal is None:
+            journal = ErrorJournal()
+        level = request.query.get("level")
+        event = request.query.get("event")
+        try:
+            page = max(1, int(request.query.get("page", "1")))
+        except ValueError:
+            page = 1
+        try:
+            per_page = max(1, min(200, int(request.query.get("per_page", "50"))))
+        except ValueError:
+            per_page = 50
+
+        result = journal.query(level=level, event=event, page=page, per_page=per_page)
+        return web.json_response(result)
+    except Exception as e:
+        log.error("journal_endpoint_error", error=str(e))
+        return web.json_response(
+            {"entries": [], "total": 0, "page": 1, "per_page": 50,
+             "pages": 0, "levels": [], "events": [], "error": str(e)},
+            status=200,
+        )
+
+
+async def handle_journal_archives(request):
+    """List available archive files (JSON API)."""
+    try:
+        journal = getattr(_orchestrator, "error_journal", None) if _orchestrator else None
+        if journal is None:
+            journal = ErrorJournal()
+        return web.json_response({"archives": journal.list_archives()})
+    except Exception as e:
+        return web.json_response({"archives": [], "error": str(e)})
+
+
+async def handle_journal_archive(request):
+    """Query a specific archive file (JSON API)."""
+    try:
+        filename = request.match_info["filename"]
+        journal = getattr(_orchestrator, "error_journal", None) if _orchestrator else None
+        if journal is None:
+            journal = ErrorJournal()
+        level = request.query.get("level")
+        event = request.query.get("event")
+        try:
+            page = max(1, int(request.query.get("page", "1")))
+        except ValueError:
+            page = 1
+        try:
+            per_page = max(1, min(200, int(request.query.get("per_page", "50"))))
+        except ValueError:
+            per_page = 50
+
+        result = journal.query_archive(
+            filename, level=level, event=event, page=page, per_page=per_page,
+        )
+        return web.json_response(result)
+    except Exception as e:
+        return web.json_response(
+            {"entries": [], "total": 0, "page": 1, "per_page": 50,
+             "pages": 0, "levels": [], "events": [], "error": str(e)},
+        )
+
+
 async def start_status_server(port: int = 8765):
     """Start the status HTTP server and background health checks."""
     global _health_check_task
+
+    # Load (or create) the OBJ export API key
+    api_key = _load_or_create_export_key()
+    log.info(
+        "export_api_key_loaded",
+        key=api_key,
+        key_file=str(_EXPORT_KEY_FILE),
+    )
+    print(f"[status_server] OBJ export API key: {api_key}", flush=True)
 
     app = web.Application()
     app.router.add_get("/", handle_index)
@@ -923,6 +1581,13 @@ async def start_status_server(port: int = 8765):
     app.router.add_get("/stats", handle_stats)
     app.router.add_get("/costs", handle_costs)
     app.router.add_get("/skills", handle_skills)
+    app.router.add_get("/journal", handle_journal)
+    app.router.add_get("/journal/archives", handle_journal_archives)
+    app.router.add_get("/journal/archive/{filename}", handle_journal_archive)
+    app.router.add_get("/cloister", handle_cloister)
+    app.router.add_get("/exports", handle_exports)
+    app.router.add_get("/export/bird.obj", handle_export_bird)
+    app.router.add_get("/export/cat.obj", handle_export_cat)
 
     runner = web.AppRunner(app)
     await runner.setup()

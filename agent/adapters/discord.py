@@ -216,7 +216,7 @@ class DiscordAdapter(BaseAdapter):
                     return
 
                 if action == "react":
-                    emoji = await self._pick_reaction(message.content)
+                    emoji = await self._pick_reaction(message.content, guild=message.guild)
                     try:
                         await message.add_reaction(emoji)
                         log.info("discord_reacted", emoji=emoji, sender=message.author.display_name)
@@ -446,27 +446,50 @@ class DiscordAdapter(BaseAdapter):
 
         await self.client.start(self.token)
 
-    async def _pick_reaction(self, text: str) -> str:
-        """Use a cheap LLM call to pick an appropriate emoji reaction."""
+    async def _pick_reaction(self, text: str, guild: discord.Guild | None = None) -> str | discord.Emoji:
+        """Use a cheap LLM call to pick an appropriate emoji reaction.
+
+        Prefers server custom emoji when available.
+        """
         if not self.relevance_provider:
             return "\U0001f44d"  # thumbs up fallback
+
+        # Build custom emoji menu if we have a guild
+        custom_emoji_map: dict[str, discord.Emoji] = {}
+        emoji_menu = ""
+        if guild and guild.emojis:
+            for e in guild.emojis:
+                if e.available:
+                    custom_emoji_map[e.name.lower()] = e
+            if custom_emoji_map:
+                names = ", ".join(f":{name}:" for name in custom_emoji_map)
+                emoji_menu = (
+                    f"\n\nPrefer these server emoji when they fit: {names}\n"
+                    "To pick one, reply with its exact name including colons, e.g. :poggers:"
+                )
 
         try:
             response = await self.relevance_provider.complete(
                 messages=[{"role": "user", "content": text[:300]}],
                 system=(
                     "Pick ONE emoji that best reacts to this message. "
-                    "Reply with ONLY the emoji, nothing else. "
-                    "Examples: \U0001f44d \U0001f525 \u2764\ufe0f \U0001f60e \U0001f389 \U0001f914 \U0001f4af \u2705 \U0001f64f \U0001f440"
+                    "Reply with ONLY the emoji or emoji name, nothing else."
+                    f"{emoji_menu}"
                 ),
                 model=self.relevance_model,
-                max_tokens=5,
+                max_tokens=15,
                 temperature=0.7,
             )
-            emoji = response.content.strip()
-            # Validate it's actually a short emoji-like string
-            if emoji and len(emoji) <= 8:
-                return emoji
+            pick = response.content.strip().strip(":")
+            # Check if it matches a custom emoji
+            if pick.lower() in custom_emoji_map:
+                return custom_emoji_map[pick.lower()]
+            # Fall back to treating it as a unicode emoji
+            raw = response.content.strip()
+            # Reject strings that are just colons/whitespace — Discord
+            # tries to parse ":" as a custom emoji with an empty snowflake ID.
+            if raw and len(raw) <= 8 and raw.strip(":"):
+                return raw
         except Exception as e:
             log.debug("react_emoji_pick_failed", error=str(e))
 

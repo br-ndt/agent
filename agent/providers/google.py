@@ -14,7 +14,20 @@ log = structlog.get_logger()
 
 class GoogleProvider(BaseProvider):
     def __init__(self, api_key: str):
-        self.client = genai.Client(api_key=api_key)
+        # Support comma-separated keys for round-robin rotation
+        keys = [k.strip() for k in api_key.split(",") if k.strip()]
+        if not keys:
+            raise ValueError("At least one Google API key is required")
+        self._keys = keys
+        self._clients = [genai.Client(api_key=k) for k in keys]
+        self._index = 0
+        self.client = self._clients[0]
+
+    def _next_client(self) -> genai.Client:
+        """Round-robin across API key clients."""
+        client = self._clients[self._index % len(self._clients)]
+        self._index += 1
+        return client
 
     async def complete(
         self,
@@ -29,6 +42,7 @@ class GoogleProvider(BaseProvider):
     ) -> LLMResponse:
         # Convert from OpenAI-style messages to Gemini format
         # Messages can include image paths via {"role": "user", "content": ..., "images": [...]}
+        client = self._next_client()
         contents = []
         for msg in messages:
             role = "model" if msg["role"] == "assistant" else "user"
@@ -55,7 +69,7 @@ class GoogleProvider(BaseProvider):
                 mime = aud.get("mime_type", "audio/mpeg") if isinstance(aud, dict) else "audio/mpeg"
                 filename = aud.get("filename", "audio.mp3") if isinstance(aud, dict) else "audio.mp3"
                 try:
-                    file_part = await self._upload_audio(data, mime, filename)
+                    file_part = await self._upload_audio(data, mime, filename, client)
                     parts.append(file_part)
                     log.info("audio_attached", filename=filename, size=len(data), mime=mime)
                 except Exception as exc:
@@ -72,7 +86,7 @@ class GoogleProvider(BaseProvider):
         if system:
             config.system_instruction = system
 
-        response = await self.client.aio.models.generate_content(
+        response = await client.aio.models.generate_content(
             model=model,
             contents=contents,
             config=config,
@@ -97,8 +111,9 @@ class GoogleProvider(BaseProvider):
                         image_bytes_list.append(bytes(data))
                 elif hasattr(part, "text") and part.text:
                     text += part.text
-        except (AttributeError, IndexError):
+        except (AttributeError, IndexError, TypeError):
             # Fall back to .text for non-generative models
+            # TypeError handles None candidates (e.g. safety-blocked responses)
             text = response.text or ""
 
         log.info(
@@ -116,7 +131,7 @@ class GoogleProvider(BaseProvider):
 
         return LLMResponse(content=text, model=model, usage=usage, images=image_bytes_list)
 
-    async def _upload_audio(self, data: bytes, mime_type: str, filename: str):
+    async def _upload_audio(self, data: bytes, mime_type: str, filename: str, client: genai.Client | None = None):
         """Upload audio via the Gemini File API and return a Part reference.
 
         The File API handles large files and is more reliable for audio than
@@ -140,7 +155,7 @@ class GoogleProvider(BaseProvider):
             loop = asyncio.get_running_loop()
             uploaded = await loop.run_in_executor(
                 None,
-                lambda: self.client.files.upload(
+                lambda: (client or self.client).files.upload(
                     file=tmp_path,
                     config=types.UploadFileConfig(mime_type=mime_type),
                 ),

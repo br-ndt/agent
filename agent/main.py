@@ -25,10 +25,35 @@ from agent.state_ledger import StateLedger
 from agent.status_server import configure as configure_status, start_status_server
 from agent.subagent_runner import SubagentRunner
 
+def _journal_processor(logger, method_name, event_dict):
+    """Structlog processor that mirrors every log event to the JSONL journal."""
+    from agent.diagnostics import ErrorJournal, VALID_LEVELS
+
+    level = event_dict.get("level", method_name)
+    if level not in VALID_LEVELS:
+        level = "info"
+    event_name = event_dict.get("event", "unknown")
+
+    # Build the message from remaining context keys
+    skip = {"event", "level", "timestamp", "_record_to_journal"}
+    ctx = {k: v for k, v in event_dict.items() if k not in skip}
+    # Use a short human-readable message
+    parts = [f"{k}={v}" for k, v in ctx.items()]
+    message = " ".join(str(p) for p in parts) if parts else event_name
+
+    try:
+        ErrorJournal().log(level, event_name, message, ctx if ctx else None)
+    except Exception:
+        pass  # never break logging
+
+    return event_dict
+
+
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.add_log_level,
+        _journal_processor,
         structlog.dev.ConsoleRenderer(),
     ],
     wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO
@@ -37,11 +62,27 @@ structlog.configure(
 log = structlog.get_logger()
 
 
+def _parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Multi-agent assistant")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to config.yaml (default: <repo>/config.yaml)")
+    parser.add_argument("--env", type=str, default=None,
+                        help="Path to .env file (default: <repo>/.env)")
+    parser.add_argument("--no-cli", action="store_true",
+                        help="Run in daemon mode (no interactive CLI)")
+    return parser.parse_args()
+
+
 async def main():
+    args = _parse_args()
     log.info("agent_starting")
 
     # ── Load config ───────────────────────────────────────────
-    cfg = load_config()
+    from agent.config import init_dotenv
+    init_dotenv(args.env)
+    config_path = Path(args.config) if args.config else None
+    cfg = load_config(config_path)
 
     # ── Build providers ───────────────────────────────────────
     providers = build_resilient_providers(cfg)
@@ -67,18 +108,33 @@ async def main():
     else:
         log.info("vision_provider_disabled", hint="Set GOOGLE_API_KEY to enable")
 
+    # ── State directory ────────────────────────────────────────
+    if cfg.state_dir:
+        state_path = Path(cfg.state_dir)
+        state_path.mkdir(parents=True, exist_ok=True)
+    else:
+        state_path = None  # use each module's default
+
     # ── Session store ─────────────────────────────────────────
-    session_store = SessionStore()
+    session_store = SessionStore(
+        db_path=state_path / "sessions.db" if state_path else None,
+    )
     await session_store.init()
 
     # ── Cost tracker ──────────────────────────────────────────
-    cost_tracker = CostTracker()
+    cost_tracker = CostTracker(
+        db_path=state_path / "costs.db" if state_path else None,
+    )
     await cost_tracker.init()
 
     # ── State ledger ───────────────────────────────────────────
-    memory_store = MemoryStore()
+    memory_store = MemoryStore(
+        db_path=state_path / "memory.db" if state_path else None,
+    )
     await memory_store.init()
-    state_ledger = StateLedger()
+    state_ledger = StateLedger(
+        db_path=state_path / "ledger.db" if state_path else None,
+    )
     await state_ledger.init()
 
     # ── Build subagent runners ────────────────────────────────
@@ -213,8 +269,7 @@ async def main():
         router.register_adapter("telegram", telegram)
         log.info("telegram_adapter_enabled")
 
-    # Check for --no-cli flag (daemon mode)
-    daemon_mode = "--no-cli" in sys.argv
+    daemon_mode = args.no_cli
 
     if not daemon_mode:
         cli = cli_adapter.CLIAdapter()

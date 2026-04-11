@@ -126,8 +126,10 @@ class SubagentRunner:
     async def run(
         self, task: str, context: str = "", session_id: str = "",
         attachments: list[dict] | None = None,
-    ) -> str:
+    ) -> tuple[str, list[bytes]]:
         """Execute a task, routing to the right tool path per provider.
+
+        Returns (text_content, generated_images).
 
         attachments: optional list of dicts with 'data' (bytes), 'mime_type', 'filename'.
             These are passed through to the LLM provider as inline parts (e.g. audio/image).
@@ -157,9 +159,12 @@ class SubagentRunner:
         )
 
         self._pending_attachments = attachments
+        # Snapshot _last_images before the call so we can isolate what
+        # this invocation produced (safe for concurrent calls).
+        self._last_images = []
 
         try:
-            return await self._run_with(
+            content = await self._run_with(
                 self.provider, self.config.model, prompt, workspace, has_tools
             )
         except Exception as e:
@@ -171,11 +176,14 @@ class SubagentRunner:
                 error=str(e),
                 fallback_model=self.fallback_model,
             )
-            return await self._run_with(
+            content = await self._run_with(
                 self.fallback_provider, self.fallback_model, prompt, workspace, has_tools
             )
         finally:
             self._pending_attachments = None
+
+        images = list(self._last_images)
+        return content, images
 
     # ── Dispatch ──────────────────────────────────────────────
 
