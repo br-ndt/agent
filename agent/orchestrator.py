@@ -227,6 +227,12 @@ class Orchestrator:
             "results and can decide what to do next — request more operations or respond to the "
             "user. You don't need to plan everything upfront; you can gather information first "
             "and act on it after.\n\n"
+            "## Preamble Rule\n"
+            "When you emit a <delegate> tag, ONLY write a brief status message BEFORE the tag "
+            "(e.g. 'On it.' or 'Generating now.'). Do NOT write text that assumes the result "
+            "is already available — no 'Here's your...', no 'Let me know if you want variations', "
+            "no placeholder text like '[result will appear]'. You will get another turn to "
+            "respond AFTER the delegation completes.\n\n"
             "## Synthesis Rule\n"
             "When a subagent like 'researcher' reports the content of a page, do not summarize "
             "it too heavily if the user's intent was to see what's on the page. "
@@ -1374,7 +1380,25 @@ def _extract_preamble(response_content: str) -> str:
     # Strip thinking tags if present
     preamble = re.sub(r"<thinking>.*?</thinking>", "", preamble, flags=re.DOTALL).strip()
 
-    return preamble
+    # Strip placeholder / post-completion text that the LLM sometimes writes
+    # before the delegate tag actually runs.  Keep only the first paragraph
+    # (the actual status message), drop anything that assumes the result is
+    # already available.
+    lines = preamble.split("\n")
+    kept: list[str] = []
+    for line in lines:
+        lower = line.lower().strip()
+        # Stop at lines that reference results not yet available
+        if any(phrase in lower for phrase in [
+            "here's your", "here is your", "here are your",
+            "result will appear", "will appear when",
+            "let me know if you want", "let me know if you'd like",
+            "want any variations", "want me to",
+        ]):
+            break
+        kept.append(line)
+
+    return "\n".join(kept).strip()
 
 
 def _summarize_delegations(delegations: list[dict]) -> str:
