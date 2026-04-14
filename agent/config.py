@@ -78,6 +78,7 @@ class Config:
     trusted_ids: set[str] = field(default_factory=set)
     basic_ids: set[str] = field(default_factory=set)
     trusted_bots: set[str] = field(default_factory=set)
+    sibling_ids: set[str] = field(default_factory=set)
 
     # Tier-based routing: tier -> {model, provider (optional)}
     tier_routing: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -172,6 +173,8 @@ def _apply_yaml(cfg: Config, raw: dict):
         cfg.basic_ids.add(bid)
     for tb in raw.get("access", {}).get("trusted_bots", []) or []:
         cfg.trusted_bots.add(tb)
+    for sib in raw.get("access", {}).get("sibling_ids", []) or []:
+        cfg.sibling_ids.add(sib)
     for tier, routing in raw.get("access", {}).get("tier_routing", {}).items():
         if tier and routing:
             model = routing.get("model", cfg.orchestrator_model)

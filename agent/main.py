@@ -252,6 +252,7 @@ async def main():
             relevance_provider=relevance_provider,
             relevance_model="gemini-2.5-flash",
             other_bots=cfg.other_bots,
+            sibling_ids=cfg.sibling_ids,
         )
         discord_bot._admin_ids = cfg.admin_ids
         router.register_adapter("discord", discord_bot)

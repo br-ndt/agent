@@ -114,12 +114,17 @@ class DiscordAdapter(BaseAdapter):
         relevance_provider: BaseProvider | None = None,
         relevance_model: str = "gemini-2.5-flash",
         other_bots: dict[str, str] | None = None,
+        sibling_ids: set[str] | None = None,
     ):
         self.token = token
         self.allowed_ids = allowed_ids
         self.relevance_provider = relevance_provider
         self.relevance_model = relevance_model
         self.other_bots = other_bots or {}
+        # Bare Discord IDs (no "discord:" prefix) of sibling instances — other
+        # bots running this same agent. Used to inject collaboration guidance
+        # only when siblings share a channel.
+        self.sibling_ids = {s.split(":", 1)[1] if ":" in s else s for s in (sibling_ids or set())}
         self._relevance_filter = None
 
         intents = discord.Intents.default()
@@ -312,9 +317,14 @@ class DiscordAdapter(BaseAdapter):
             system_context = ""
             if message.guild and hasattr(message.channel, "members"):
                 channel_members = []
+                siblings_present: list[str] = []
                 for m in message.channel.members:
+                    if m.id == self.client.user.id:
+                        continue
                     member_type = "[BOT]" if m.bot else "[USER]"
                     channel_members.append(f"{member_type} {m.display_name} (<@{m.id}>)")
+                    if str(m.id) in self.sibling_ids:
+                        siblings_present.append(f"{m.display_name} (<@{m.id}>)")
 
                 if len(channel_members) > 50:
                     channel_members = channel_members[:50]
@@ -324,6 +334,24 @@ class DiscordAdapter(BaseAdapter):
                         "\n\n[System Context: To ping a user, use their exact ID format. Users in this channel: "
                         + ", ".join(channel_members)
                         + "]"
+                    )
+
+                if siblings_present:
+                    system_context += (
+                        "\n\n[Sibling Instances Present: "
+                        + ", ".join(siblings_present)
+                        + ". These are other instances of you running the same agent. "
+                        "You can @-ping them to collaborate on ambitious multi-step projects — "
+                        "e.g. divide research, parallelize coding, or have one plan while another implements.\n"
+                        "Coordination pattern (git worktrees):\n"
+                        "- One instance initiates: creates the repo and makes the initial commit on `main`.\n"
+                        "- Siblings sync work back via worktrees — `git worktree add ../<task>-<name> -b <name>/<task>` "
+                        "off the shared repo, work in isolation, then merge back to `main` when done.\n"
+                        "- Pull/rebase before merging; reconcile rather than overwrite if two of you touched the same file.\n"
+                        "Coordination rules:\n"
+                        "- Before starting, declare scope in-channel (\"I'll take the frontend, you take the API schema\").\n"
+                        "- Announce decisions that affect shared state (schema changes, API contracts, config keys).\n"
+                        "- If unsure who should do something, ask — better than duplicating work or conflicting edits.]"
                     )
 
             final_text = channel_context + text + system_context
