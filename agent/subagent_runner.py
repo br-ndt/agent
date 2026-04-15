@@ -13,6 +13,7 @@ uniform interface regardless of provider.
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -31,6 +32,61 @@ log = structlog.get_logger()
 MAX_TURNS = 15
 BASE_DIR = Path(__file__).resolve().parent.parent
 WORKSPACES_DIR = BASE_DIR / "workspaces"
+
+_SEND_FILE_RE = re.compile(r"<send_file>(.*?)</send_file>", re.DOTALL)
+_SEND_FILE_MAX = 16  # hard cap on attachments per delegation
+_SEND_FILE_MAX_BYTES = 25 * 1024 * 1024  # per-file size cap (25 MiB)
+
+
+def _extract_send_files(content: str, workspace: Path | None) -> tuple[str, list[bytes]]:
+    """Parse <send_file>path</send_file> tags, read bytes, strip tags from content.
+
+    Paths are resolved relative to the subagent's workspace and must stay
+    inside it. Absolute paths are rejected. Missing/oversized/invalid files
+    are logged and dropped; the tag is still stripped so it never leaks to
+    the user-facing reply.
+    """
+    if "<send_file>" not in content:
+        return content, []
+
+    files: list[bytes] = []
+    ws = workspace.resolve() if workspace else None
+
+    for raw in _SEND_FILE_RE.findall(content):
+        if len(files) >= _SEND_FILE_MAX:
+            log.warning("send_file_cap_exceeded", cap=_SEND_FILE_MAX)
+            break
+        path_str = raw.strip()
+        if not path_str:
+            continue
+        p = Path(path_str)
+        if p.is_absolute():
+            log.warning("send_file_absolute_rejected", path=path_str)
+            continue
+        if ws is None:
+            log.warning("send_file_no_workspace", path=path_str)
+            continue
+        target = (ws / p).resolve()
+        try:
+            target.relative_to(ws)
+        except ValueError:
+            log.warning("send_file_outside_workspace", path=str(target), workspace=str(ws))
+            continue
+        if not target.is_file():
+            log.warning("send_file_not_found", path=str(target))
+            continue
+        size = target.stat().st_size
+        if size > _SEND_FILE_MAX_BYTES:
+            log.warning("send_file_too_large", path=str(target), size=size)
+            continue
+        try:
+            files.append(target.read_bytes())
+            log.info("send_file_attached", path=str(target), size=size)
+        except Exception as e:
+            log.warning("send_file_read_failed", path=str(target), error=str(e))
+
+    stripped = _SEND_FILE_RE.sub("", content).strip()
+    return stripped, files
 
 
 async def _agent_git_identity() -> tuple[str, str]:
@@ -181,6 +237,15 @@ class SubagentRunner:
             )
         finally:
             self._pending_attachments = None
+
+        # Extract <send_file> tags — subagents with file_ops/bash tools can
+        # surface PNGs/assets they wrote to disk by wrapping a workspace-relative
+        # path in <send_file>…</send_file>. Tags are stripped from the returned
+        # content so they never appear in the user-facing reply.
+        if workspace:
+            content, sent_files = _extract_send_files(content, workspace)
+            if sent_files:
+                self._last_images.extend(sent_files)
 
         images = list(self._last_images)
         return content, images

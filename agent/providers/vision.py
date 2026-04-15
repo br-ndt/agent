@@ -32,14 +32,14 @@ class VisionProvider:
         self._clients = [genai.Client(api_key=k) for k in keys]
         self._index = 0
         self.client = self._clients[0]
+        self.vision_model = "gemini-3-flash-preview"  # For image understanding
+        self.generation_model = "gemini-3.1-flash-image-preview"  # Nano Banana
 
     def _next_client(self) -> genai.Client:
         """Round-robin across API key clients."""
         client = self._clients[self._index % len(self._clients)]
         self._index += 1
         return client
-        self.vision_model = "gemini-3-flash-preview"  # For image understanding
-        self.generation_model = "gemini-3.1-flash-image-preview"  # Nano Banana
         
     async def analyze_image(
         self,
