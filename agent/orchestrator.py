@@ -14,7 +14,7 @@ from agent.cost_tracker import CostTracker
 from agent.diagnostics import ErrorJournal, DiagnosticStore, build_diagnosis_prompt
 from agent.knowledge import KnowledgeStore, KnowledgeDoc
 from agent.memory import MemoryStore, build_memory_index_prompt, infer_room
-from agent.providers.base import BaseProvider
+from agent.providers.base import BaseProvider, LLMResponse
 from agent.providers.vision import VisionProvider
 from agent.persona_enforcement import check_output_for_violations
 from agent.sanitizer import sanitize_delegation_result
@@ -33,6 +33,22 @@ from agent.state_ledger import StateLedger, EntryType
 from agent.subagent_runner import SubagentRunner, WORKSPACES_DIR
 
 log = structlog.get_logger()
+
+# The orchestrator is a text-only coordinator — it should emit <delegate>
+# XML, not touch the filesystem. But when its model resolves to claude_cli,
+# the CLI subprocess runs with --dangerously-skip-permissions and inherits
+# the daemon's cwd (= repo root), so without guardrails Claude will happily
+# Write/Edit scratch files right into the project root. We pin the cwd to a
+# dedicated sandbox and explicitly disallow every Claude-native tool on
+# every orchestrator-level provider call. Non-claude providers ignore these
+# kwargs harmlessly.
+ORCHESTRATOR_SANDBOX = WORKSPACES_DIR / "_orchestrator"
+_ORCHESTRATOR_DISALLOWED_TOOLS = [
+    "Bash", "Write", "Edit", "MultiEdit", "NotebookEdit",
+    "Read", "Glob", "Grep",
+    "Task", "TodoWrite", "Agent",
+    "WebFetch", "WebSearch",
+]
 
 
 def _parse_memory_ops(text: str) -> list[dict]:
@@ -128,6 +144,10 @@ class Orchestrator:
         self.state_ledger = state_ledger
         self.knowledge_store = knowledge_store or KnowledgeStore()
         self.knowledge_store.load()
+
+        # Scratch dir for orchestrator-level provider subprocesses — see
+        # ORCHESTRATOR_SANDBOX docstring at module top for rationale.
+        ORCHESTRATOR_SANDBOX.mkdir(parents=True, exist_ok=True)
 
         self.sessions: dict[str, PersistentSession] = {}
         self.session_store = session_store
@@ -487,6 +507,8 @@ class Orchestrator:
                     model=classify_model,
                     max_tokens=10,
                     temperature=0.0,
+                    cwd=str(ORCHESTRATOR_SANDBOX),
+                    disallowed_tools=_ORCHESTRATOR_DISALLOWED_TOOLS,
                 )
                 msg_class = classify_response.content.strip().upper()
                 if self.cost_tracker:
@@ -506,20 +528,21 @@ class Orchestrator:
                 msg_class = "DELEGATE"
 
         # ── Select model + prompt tier ──────────────────────────────
+        # COMPLEX messages (nuanced reasoning, analysis, multi-step thinking)
+        # get auto-delegated to the planner subagent rather than running a
+        # heavier model at the orchestrator root. Keeps deep-reasoning work
+        # in a proper workspace and out of the text-only coordinator.
+        force_planner_delegation = False
         if msg_class == "SIMPLE":
             prompt_tier = "minimal"
             route_model, route_provider = model, provider
             route_provider_name = provider_name
         elif msg_class == "COMPLEX":
             prompt_tier = "full"
-            fallback = self.config.orchestrator_fallback_model
-            if fallback:
-                route_model = fallback
-                route_provider_name = infer_provider(fallback)
-                route_provider = self.providers.get(route_provider_name, provider)
-            else:
-                route_model, route_provider = model, provider
-                route_provider_name = provider_name
+            route_model, route_provider = model, provider
+            route_provider_name = provider_name
+            if "planner" in self.subagents:
+                force_planner_delegation = True
         else:
             prompt_tier = "full"
             route_model, route_provider = model, provider
@@ -551,42 +574,61 @@ class Orchestrator:
             if session_id in self._active_requests:
                 self._active_requests[session_id]["pass"] = pass_num
 
-            # Use smarter model for synthesis passes (pass > 0)
-            if pass_num > 0:
-                synth_model = (
-                    self.config.synthesis_model
-                    or self.config.orchestrator_fallback_model
-                    or route_model
-                )
-                synth_provider_name = infer_provider(synth_model)
-                synth_provider = self.providers.get(synth_provider_name, route_provider)
-                pass_model, pass_provider = synth_model, synth_provider
-                pass_provider_name = synth_provider_name
-            else:
-                pass_model, pass_provider = route_model, route_provider
-                pass_provider_name = route_provider_name
-
-            system_prompt = self.get_system_prompt(
-                session_id=session_id,
-                prompt_tier=prompt_tier,
-                memory_index=memory_index_prompt,
-            )
-            response = await pass_provider.complete(
-                messages=session.get_messages_for_llm(),
-                system=system_prompt,
-                model=pass_model,
-                max_tokens=self.config.orchestrator_max_tokens,
-            )
-
-            if self.cost_tracker:
-                await self.cost_tracker.log_call(
-                    provider=pass_provider_name,
+            if force_planner_delegation and pass_num == 0:
+                # COMPLEX → planner: skip the pass-0 LLM call and synthesize
+                # a delegation to the planner subagent. The existing loop
+                # then dispatches it, and pass 1 synthesizes a conversational
+                # reply from the planner's output.
+                pass_model = "synthetic:complex_to_planner"
+                pass_provider_name = "synthetic"
+                response = LLMResponse(
+                    content=f'<delegate agent="planner">{user_msg}</delegate>',
                     model=pass_model,
-                    usage=response.usage,
-                    session_id=session_id,
-                    agent="orchestrator",
-                    duration_ms=int((time.monotonic() - pass_start) * 1000),
                 )
+                log.info(
+                    "complex_routed_to_planner",
+                    session_id=session_id,
+                    user_msg_preview=user_msg[:200],
+                )
+            else:
+                # Use smarter model for synthesis passes (pass > 0)
+                if pass_num > 0:
+                    synth_model = (
+                        self.config.synthesis_model
+                        or self.config.orchestrator_fallback_model
+                        or route_model
+                    )
+                    synth_provider_name = infer_provider(synth_model)
+                    synth_provider = self.providers.get(synth_provider_name, route_provider)
+                    pass_model, pass_provider = synth_model, synth_provider
+                    pass_provider_name = synth_provider_name
+                else:
+                    pass_model, pass_provider = route_model, route_provider
+                    pass_provider_name = route_provider_name
+
+                system_prompt = self.get_system_prompt(
+                    session_id=session_id,
+                    prompt_tier=prompt_tier,
+                    memory_index=memory_index_prompt,
+                )
+                response = await pass_provider.complete(
+                    messages=session.get_messages_for_llm(),
+                    system=system_prompt,
+                    model=pass_model,
+                    max_tokens=self.config.orchestrator_max_tokens,
+                    cwd=str(ORCHESTRATOR_SANDBOX),
+                    disallowed_tools=_ORCHESTRATOR_DISALLOWED_TOOLS,
+                )
+
+                if self.cost_tracker:
+                    await self.cost_tracker.log_call(
+                        provider=pass_provider_name,
+                        model=pass_model,
+                        usage=response.usage,
+                        session_id=session_id,
+                        agent="orchestrator",
+                        duration_ms=int((time.monotonic() - pass_start) * 1000),
+                    )
 
             log.info(
                 "orchestrator_pass",
