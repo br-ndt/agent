@@ -1443,53 +1443,18 @@ def _extract_preamble(response_content: str) -> str:
             break
         kept.append(line)
 
-    collapsed = " ".join(ln.strip() for ln in kept if ln.strip()).strip()
-    return _cap_status_message(collapsed)
-
-
-def _cap_status_message(text: str, max_sentences: int = 2, max_chars: int = 240) -> str:
-    """Keep a status message brief: at most `max_sentences` sentences and
-    `max_chars` characters. Guards against the LLM ignoring the preamble rule
-    and dumping a wall of text before the delegation tag."""
-    if not text:
-        return ""
-    parts = re.split(r"(?<=[.!?])\s+", text.strip())
-    capped = " ".join(parts[:max_sentences]).strip()
-    if len(capped) > max_chars:
-        capped = capped[: max_chars - 1].rstrip() + "…"
-    return capped
+    return " ".join(ln.strip() for ln in kept if ln.strip()).strip()
 
 
 def _summarize_delegations(delegations: list[dict]) -> str:
     """Fallback status message when the LLM emitted no preamble.
 
-    Produces a short acknowledgment + 1–2 sentence summary of what got
-    delegated. Does NOT dump full task text — task detail stays internal.
+    The preamble rule in the system prompt already asks for a short
+    acknowledgment + 1–2 sentence summary. If the LLM skipped that, we
+    don't have anything good to synthesize from the internal task text —
+    better to stay terse than to mangle it.
     """
-    first_sentences: list[str] = []
-    for d in delegations:
-        task = d["task"].strip()
-        chosen = ""
-        for line in task.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.startswith(("Using your skill", "##", "#", "```", "---", "- ", "* ")):
-                continue
-            chosen = re.split(r"(?<=[.!?])\s+", stripped)[0]
-            break
-        if chosen:
-            first_sentences.append(chosen.rstrip(".!?"))
-
-    if not first_sentences:
-        return "On it."
-
-    if len(first_sentences) == 1:
-        body = first_sentences[0]
-    else:
-        body = "; ".join(first_sentences[:2])
-
-    return _cap_status_message(f"On it. {body}.", max_sentences=2, max_chars=240)
+    return "On it."
 
 
 def _parse_vision_ops(text: str) -> list[dict]:

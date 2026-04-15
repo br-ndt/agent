@@ -221,7 +221,7 @@ class DiscordAdapter(BaseAdapter):
                     return
 
                 if action == "react":
-                    emoji = await self._pick_reaction(message.content, guild=message.guild)
+                    emoji = await self._pick_reaction(message)
                     try:
                         await message.add_reaction(emoji)
                         log.info("discord_reacted", emoji=emoji, sender=message.author.display_name)
@@ -474,13 +474,18 @@ class DiscordAdapter(BaseAdapter):
 
         await self.client.start(self.token)
 
-    async def _pick_reaction(self, text: str, guild: discord.Guild | None = None) -> str | discord.Emoji:
-        """Use a cheap LLM call to pick an appropriate emoji reaction.
-
-        Prefers server custom emoji when available.
-        """
+    async def _pick_reaction(
+        self, message: discord.Message
+    ) -> str | discord.Emoji:
+        """Pick an emoji that fits the message. Strongly prefers server custom
+        emoji. Uses sender + a little channel context so the choice matches
+        the conversational vibe, not just the literal message text."""
         if not self.relevance_provider:
             return "\U0001f44d"  # thumbs up fallback
+
+        guild = message.guild
+        text = (message.content or "").strip() or "(no text)"
+        sender = message.author.display_name
 
         # Build custom emoji menu if we have a guild
         custom_emoji_map: dict[str, discord.Emoji] = {}
@@ -492,31 +497,54 @@ class DiscordAdapter(BaseAdapter):
             if custom_emoji_map:
                 names = ", ".join(f":{name}:" for name in custom_emoji_map)
                 emoji_menu = (
-                    f"\n\nPrefer these server emoji when they fit: {names}\n"
-                    "To pick one, reply with its exact name including colons, e.g. :poggers:"
+                    f"\n\nServer custom emoji available: {names}\n"
+                    "STRONGLY prefer a server emoji over a generic unicode one "
+                    "when ANY of them fits even loosely — server emoji are what "
+                    "gives a reaction personality. Reply with the exact name "
+                    "including colons, e.g. :poggers:. Only fall back to a "
+                    "unicode emoji if no server emoji is remotely appropriate."
                 )
+
+        # Pull a bit of recent channel context so the reaction fits the
+        # conversation, not just the literal last message.
+        context_lines: list[str] = []
+        try:
+            async for prev in message.channel.history(limit=4, before=message):
+                prev_text = (prev.content or "").strip().replace("\n", " ")
+                if prev_text:
+                    context_lines.append(
+                        f"{prev.author.display_name}: {prev_text[:140]}"
+                    )
+        except Exception as e:
+            log.debug("react_context_fetch_failed", error=str(e))
+        context_lines.reverse()
+        snippet = "\n".join(context_lines + [f"{sender}: {text[:400]}"])
 
         try:
             response = await self.relevance_provider.complete(
-                messages=[{"role": "user", "content": text[:300]}],
+                messages=[{"role": "user", "content": snippet}],
                 system=(
-                    "Pick ONE emoji that best reacts to this message. "
+                    "Pick ONE emoji that best reacts to the LAST message in the "
+                    "snippet below, from the perspective of a chat-savvy bot. "
+                    "Consider tone, subject, humor, and how it follows the prior "
+                    "messages. Avoid defaulting to 👍 unless it genuinely fits. "
                     "Reply with ONLY the emoji or emoji name, nothing else."
                     f"{emoji_menu}"
                 ),
                 model=self.relevance_model,
-                max_tokens=15,
-                temperature=0.7,
+                max_tokens=20,
+                temperature=0.6,
             )
-            pick = response.content.strip().strip(":")
-            # Check if it matches a custom emoji
-            if pick.lower() in custom_emoji_map:
-                return custom_emoji_map[pick.lower()]
-            # Fall back to treating it as a unicode emoji
             raw = response.content.strip()
-            # Reject strings that are just colons/whitespace — Discord
-            # tries to parse ":" as a custom emoji with an empty snowflake ID.
-            if raw and len(raw) <= 8 and raw.strip(":"):
+            pick = raw.strip(":").lower()
+            # Check if it matches a custom emoji
+            if pick in custom_emoji_map:
+                return custom_emoji_map[pick]
+            # Fall back to treating it as a unicode emoji. Require a short
+            # non-alphanumeric string — rejects colons-only input (which Discord
+            # tries to parse as a custom emoji with an empty snowflake ID) and
+            # catches the LLM returning a word instead of an emoji glyph.
+            if raw and len(raw) <= 8 and not raw[0].isalnum() and raw.strip(":"):
                 return raw
         except Exception as e:
             log.debug("react_emoji_pick_failed", error=str(e))
