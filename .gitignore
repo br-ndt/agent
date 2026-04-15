@@ -12,6 +12,7 @@ skills/
 !skills/*/SKILL.example.md
 !personas/README.md
 config.yaml
+CLAUDE.local.md
 
 # Agent output
 workspaces/

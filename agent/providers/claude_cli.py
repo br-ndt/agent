@@ -22,12 +22,19 @@ Usage in config.yaml:
 
 import asyncio
 import json
+from pathlib import Path
 
 import structlog
 
 from .base import BaseProvider, LLMResponse
 
 log = structlog.get_logger()
+
+# The repo-root CLAUDE.local.md is written for the harness-dev Claude Code
+# session (the outer shell used to work on this project), not for subagents
+# spawned by the harness itself. Excluded from subagent subprocesses so its
+# instructions don't bleed into their personas via CLAUDE.md auto-discovery.
+_HARNESS_CLAUDE_MD = str(Path(__file__).resolve().parent.parent.parent / "CLAUDE.local.md")
 
 # Maps long model names to CLI short names
 MODEL_ALIASES = {
@@ -65,6 +72,7 @@ class ClaudeCLIProvider(BaseProvider):
             "--verbose",
             "--output-format", "stream-json",
             "--dangerously-skip-permissions",
+            "--settings", json.dumps({"claudeMdExcludes": [_HARNESS_CLAUDE_MD]}),
             "--model", cli_model,
         ]
 
