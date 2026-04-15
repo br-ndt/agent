@@ -228,11 +228,14 @@ class Orchestrator:
             "user. You don't need to plan everything upfront; you can gather information first "
             "and act on it after.\n\n"
             "## Preamble Rule\n"
-            "When you emit a <delegate> tag, ONLY write a brief status message BEFORE the tag "
-            "(e.g. 'On it.' or 'Generating now.'). Do NOT write text that assumes the result "
-            "is already available — no 'Here's your...', no 'Let me know if you want variations', "
-            "no placeholder text like '[result will appear]'. You will get another turn to "
-            "respond AFTER the delegation completes.\n\n"
+            "When you emit a <delegate> tag, the text BEFORE the tag must be: a short "
+            "acknowledgment (e.g. 'On it.', 'Got it.', 'Sure.') followed by at most a "
+            "1–2 sentence summary of what you're delegating out. Keep it terse — one "
+            "short paragraph, no bullet lists, no section headers, no restating the "
+            "user's request back at them. Do NOT write text that assumes the result is "
+            "already available — no 'Here's your...', no 'Let me know if you want "
+            "variations', no placeholder text like '[result will appear]'. You will "
+            "get another turn to respond AFTER the delegation completes.\n\n"
             "## Synthesis Rule\n"
             "When a subagent like 'researcher' reports the content of a page, do not summarize "
             "it too heavily if the user's intent was to see what's on the page. "
@@ -1398,28 +1401,53 @@ def _extract_preamble(response_content: str) -> str:
             break
         kept.append(line)
 
-    return "\n".join(kept).strip()
+    collapsed = " ".join(ln.strip() for ln in kept if ln.strip()).strip()
+    return _cap_status_message(collapsed)
+
+
+def _cap_status_message(text: str, max_sentences: int = 2, max_chars: int = 240) -> str:
+    """Keep a status message brief: at most `max_sentences` sentences and
+    `max_chars` characters. Guards against the LLM ignoring the preamble rule
+    and dumping a wall of text before the delegation tag."""
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    capped = " ".join(parts[:max_sentences]).strip()
+    if len(capped) > max_chars:
+        capped = capped[: max_chars - 1].rstrip() + "…"
+    return capped
 
 
 def _summarize_delegations(delegations: list[dict]) -> str:
-    """Turn delegation dicts into a short, natural status message.
+    """Fallback status message when the LLM emitted no preamble.
 
-    Speaks as a single voice — no mention of subagents or delegation.
-    Extracts the gist of each task and varies the phrasing so it
-    doesn't feel like a template.
+    Produces a short acknowledgment + 1–2 sentence summary of what got
+    delegated. Does NOT dump full task text — task detail stays internal.
     """
-    snippets: list[str] = []
+    first_sentences: list[str] = []
     for d in delegations:
         task = d["task"].strip()
-        # Strip internal boilerplate (knowledge injection, markdown headers, etc.)
-        lines = []
+        chosen = ""
         for line in task.splitlines():
             stripped = line.strip()
-            if stripped and not stripped.startswith(("Using your skill", "##", "```", "---")):
-                lines.append(stripped)
-        snippets.append(" ".join(lines) if lines else task.splitlines()[0].strip())
+            if not stripped:
+                continue
+            if stripped.startswith(("Using your skill", "##", "#", "```", "---", "- ", "* ")):
+                continue
+            chosen = re.split(r"(?<=[.!?])\s+", stripped)[0]
+            break
+        if chosen:
+            first_sentences.append(chosen.rstrip(".!?"))
 
-    return "\n\n".join(snippets)
+    if not first_sentences:
+        return "On it."
+
+    if len(first_sentences) == 1:
+        body = first_sentences[0]
+    else:
+        body = "; ".join(first_sentences[:2])
+
+    return _cap_status_message(f"On it. {body}.", max_sentences=2, max_chars=240)
 
 
 def _parse_vision_ops(text: str) -> list[dict]:
