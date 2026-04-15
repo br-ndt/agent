@@ -203,7 +203,14 @@ class Orchestrator:
                 "generate images, or run commands. The key word is DO, not ASK ABOUT.\n"
                 "- COMPLEX: nuanced analysis, architecture, multi-step reasoning, "
                 "debate, detailed explanations, synthesis of multiple topics — but still "
-                "answerable conversationally without tools\n\n"
+                "answerable conversationally without tools\n"
+                "- FOLLOWUP: the user is commenting on, clarifying, reacting to, or asking "
+                "a small question about work that is currently in flight or that the "
+                "assistant just produced in the previous turn. Pick this ONLY when a "
+                "[recent context] block is present below AND the new message is plausibly "
+                "a continuation of it — e.g. \"any update?\", \"what about the X part\", "
+                "\"why did you do it that way\", \"that's wrong, fix Y\". If the user is "
+                "asking for a new piece of work, choose DELEGATE/SIMPLE/COMPLEX instead.\n\n"
                 "IMPORTANT: Questions about how something works, what skills exist, "
                 "or explaining a concept are SIMPLE or COMPLEX, not DELEGATE. "
                 "DELEGATE is only for requests that require tool execution.\n\n"
@@ -383,6 +390,42 @@ class Orchestrator:
 
         return result
 
+    def _build_classify_context(self, session_id: str, session) -> str:
+        """Build a compact context block for the classifier, or '' if none.
+
+        Returns a "[recent context]" block summarizing any in-flight delegations
+        for this session and the last assistant turn. Used so the classifier can
+        recognize follow-up messages instead of treating them as fresh asks.
+        """
+        parts: list[str] = []
+
+        active = [
+            (name, info) for name, info in self._active_delegations.items()
+            if info.get("session_id") == session_id
+        ]
+        if active:
+            lines = []
+            for name, info in active:
+                task_preview = (info.get("task") or "?")[:120]
+                lines.append(f"  - {name} is running: {task_preview}")
+            parts.append("in-flight delegations:\n" + "\n".join(lines))
+
+        last_assistant = ""
+        if session is not None:
+            for msg in reversed(session.history[:-1]):  # exclude the just-added user msg
+                if msg.get("role") == "assistant":
+                    last_assistant = (msg.get("content") or "").strip()
+                    break
+        if last_assistant:
+            preview = last_assistant[:300].replace("\n", " ")
+            if len(last_assistant) > 300:
+                preview += "…"
+            parts.append(f"last assistant turn: {preview}")
+
+        if not parts:
+            return ""
+        return "[recent context]\n" + "\n".join(parts) + "\n[/recent context]\n\n"
+
     MAX_PASSES = 4
 
     async def handle(
@@ -494,6 +537,8 @@ class Orchestrator:
         classify_provider_name = infer_provider(classify_model)
         classify_provider = self.providers.get(classify_provider_name, provider)
 
+        classify_ctx = self._build_classify_context(session_id, session)
+
         if tier in ("basic", "bot"):
             msg_class = "SIMPLE"
             log.info("classify_result", classification=msg_class, reason=f"forced_for_{tier}")
@@ -502,7 +547,7 @@ class Orchestrator:
         else:
             try:
                 classify_response = await classify_provider.complete(
-                    messages=[{"role": "user", "content": user_msg}],
+                    messages=[{"role": "user", "content": classify_ctx + user_msg}],
                     system=self.get_system_prompt(prompt_tier="classify"),
                     model=classify_model,
                     max_tokens=10,
@@ -520,8 +565,13 @@ class Orchestrator:
                         agent="classifier",
                         duration_ms=int((time.monotonic() - start) * 1000),
                     )
-                if msg_class not in ("SIMPLE", "DELEGATE", "COMPLEX"):
+                if msg_class not in ("SIMPLE", "DELEGATE", "COMPLEX", "FOLLOWUP"):
                     msg_class = "DELEGATE"
+                # FOLLOWUP only valid when there's actually recent context to
+                # follow up on — otherwise the classifier hallucinated continuity.
+                if msg_class == "FOLLOWUP" and not classify_ctx:
+                    log.info("classify_followup_demoted", reason="no_recent_context")
+                    msg_class = "SIMPLE"
                 log.info("classify_result", classification=msg_class)
             except Exception as e:
                 log.warning("classify_failed", error=str(e))
@@ -533,7 +583,10 @@ class Orchestrator:
         # heavier model at the orchestrator root. Keeps deep-reasoning work
         # in a proper workspace and out of the text-only coordinator.
         force_planner_delegation = False
-        if msg_class == "SIMPLE":
+        if msg_class == "SIMPLE" or msg_class == "FOLLOWUP":
+            # FOLLOWUP routes like SIMPLE — minimal prompt, no fresh delegation.
+            # The conversational pass already has session history, so it can
+            # reference what was just done without re-running it.
             prompt_tier = "minimal"
             route_model, route_provider = model, provider
             route_provider_name = provider_name
@@ -611,6 +664,17 @@ class Orchestrator:
                     prompt_tier=prompt_tier,
                     memory_index=memory_index_prompt,
                 )
+                if msg_class == "FOLLOWUP" and pass_num == 0:
+                    system_prompt += (
+                        "\n\n## Followup mode\n"
+                        "The user is commenting on or asking about work that is "
+                        "in flight or that you just completed. Respond conversationally "
+                        "based on the prior turn — do NOT delegate or re-run the task. "
+                        "If they're pointing out a problem, acknowledge it; if they're "
+                        "asking a clarifying question, answer it; if they want a tweak "
+                        "you can describe in words, do that. Only delegate if they "
+                        "are clearly asking for new work."
+                    )
                 response = await pass_provider.complete(
                     messages=session.get_messages_for_llm(),
                     system=system_prompt,
