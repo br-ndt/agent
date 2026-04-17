@@ -102,12 +102,6 @@ class Router:
             async with self._quiet_lock:
                 quiet_now = self._quiet
             if quiet_now:
-                adapter = self.adapters.get(msg.platform)
-                if adapter:
-                    await adapter.send(
-                        msg.chat_id,
-                        "I'm currently in quiet mode. An admin can wake me with `WAKE`.",
-                    )
                 log.info("quiet_mode_rejected", sender=msg.sender_name, platform=msg.platform)
                 return
 
